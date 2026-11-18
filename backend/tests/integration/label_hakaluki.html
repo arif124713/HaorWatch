@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Hakaluki hand-labeling (diagnostic tool)</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css">
+<style>
+  body { margin: 0; font-family: monospace; }
+  #map { height: 88vh; }
+  #bar { padding: 6px 10px; background: #111; color: #eee; font-size: 13px; }
+  #bar select, #bar button { font-family: monospace; }
+  .tile-label { font-size: 10px; color: #00e5ff; text-shadow: 0 0 3px #000; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <strong>Hakaluki hand-labeler</strong> —
+  tile: <select id="tileSelect"></select>
+  show VH overlay: <input type="checkbox" id="overlayCb" checked>
+  <button id="exportBtn">Export labels.geojson</button>
+  <span id="count">0 polygons</span>
+  <span style="color:#9ca"> | draw ONLY what was actually underwater on 2026-09-18 (thin channels count)</span>
+</div>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script>
+const map = L.map('map');
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
+
+const drawn = L.featureGroup().addTo(map);
+let overlays = {};
+let tileLayers = {};
+let currentTile = null;
+let allTiles = {};
+
+L.control.layers(null, {}, { position: 'topright' }).addTo(map);
+
+const drawControl = new L.Control.Draw({
+  draw: { polyline: false, circle: false, rectangle: false, circlemarker: false, marker: false,
+          polygon: { allowIntersection: false, shapeOptions: { color: '#00e5ff', weight: 2, fillOpacity: 0.25 } } },
+  edit: { featureGroup: drawn }
+});
+map.addControl(drawControl);
+
+map.on(L.Draw.Event.CREATED, event => {
+  event.layer.properties = { tile_id: currentTile, label: 'water' };
+  drawn.addLayer(event.layer);
+  updateCount();
+});
+map.on(L.Draw.Event.EDITED, updateCount);
+map.on(L.Draw.Event.DELETED, updateCount);
+
+function updateCount() {
+  document.getElementById('count').textContent = drawn.getLayers().length + ' polygons';
+}
+
+fetch('/data/hakaluki_labelkit/tiles.geojson')
+  .then(r => r.json())
+  .then(fc => {
+    fc.features.forEach(feature => {
+      const tileId = feature.properties.tile_id;
+      allTiles[tileId] = feature;
+      const layer = L.geoJSON(feature, {
+        style: { color: '#00e5ff', weight: 1, fill: false },
+        onEachFeature: (f, l) => l.bindTooltip(tileId, { permanent: true, className: 'tile-label', direction: 'center' })
+      }).addTo(map);
+      tileLayers[tileId] = layer;
+      const bounds = layer.getBounds();
+      const option = document.createElement('option');
+      option.value = tileId;
+      option.textContent = tileId;
+      document.getElementById('tileSelect').appendChild(option);
+    });
+    const first = fc.features[0];
+    if (first) {
+      map.fitBounds(L.geoJSON(first).getBounds());
+      currentTile = first.properties.tile_id;
+      document.getElementById('tileSelect').value = currentTile;
+      showOverlay(currentTile);
+    }
+    document.getElementById('tileSelect').addEventListener('change', event => {
+      currentTile = event.target.value;
+      map.fitBounds(tileLayers[currentTile].getBounds());
+      if (document.getElementById('overlayCb').checked) showOverlay(currentTile);
+    });
+    document.getElementById('overlayCb').addEventListener('change', event => {
+      if (event.target.checked) showOverlay(currentTile);
+      else if (overlays[currentTile]) map.removeLayer(overlays[currentTile]);
+    });
+  });
+
+function showOverlay(tileId) {
+  if (!tileId || !allTiles[tileId]) return;
+  if (!overlays[tileId]) {
+    const bounds = L.geoJSON(allTiles[tileId]).getBounds();
+    overlays[tileId] = L.imageOverlay(`data/hakaluki_labelkit/${tileId}/1_vh_gray.png`, bounds, { opacity: 0.65 });
+  }
+  if (!map.hasLayer(overlays[tileId])) map.addLayer(overlays[tileId]);
+}
+
+document.getElementById('exportBtn').addEventListener('click', () => {
+  const features = drawn.getLayers().map(layer => {
+    const geo = layer.toGeoJSON();
+    geo.properties = { tile_id: layer.properties?.tile_id || currentTile, label: 'water' };
+    return geo;
+  });
+  const blob = new Blob([JSON.stringify({ type: 'FeatureCollection', features }, null, 1)], { type: 'application/geo+json' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = 'labels.geojson';
+  link.click();
+});
+</script>
+</body>
+</html>

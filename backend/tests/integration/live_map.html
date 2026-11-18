@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HaorWatch API live test harness (diagnostic only)</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  body { margin: 0; font-family: monospace; }
+  #map { height: 92vh; }
+  #bar { padding: 6px 10px; background: #111; color: #eee; font-size: 13px; }
+  #bar label { margin-right: 14px; cursor: pointer; }
+  .sw { display: inline-block; width: 10px; height: 10px; margin-right: 4px; border: 1px solid #fff; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <strong>HaorWatch live API test</strong> —
+  <label><span class="sw" style="background:#3388ff"></span><input type="checkbox" id="cbArea" checked> study_area</label>
+  <label><span class="sw" style="background:#e11d48"></span><input type="checkbox" id="cbMl" checked> ml_flood (U-Net)</label>
+  <label><span class="sw" style="background:#f59e0b"></span><input type="checkbox" id="cbOtsu" checked> baseline_flood (Otsu)</label>
+  <span id="meta"></span>
+</div>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const API = 'http://localhost:8000/api/v1';
+const map = L.map('map').setView([9.3, -1.47], 11);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
+
+const styles = {
+  study_area: { color: '#3388ff', weight: 2, fill: false },
+  ml_flood: { color: '#e11d48', weight: 1, fillColor: '#e11d48', fillOpacity: 0.55 },
+  baseline_flood: { color: '#f59e0b', weight: 1, fillColor: '#f59e0b', fillOpacity: 0.3 },
+};
+const groups = {};
+
+async function loadLatest() {
+  const params = new URLSearchParams(location.search);
+  const slug = params.get('slug');
+  const areas = (await (await fetch(`${API}/study-areas`)).json()).items;
+  const demo = slug ? areas.find(a => a.slug === slug) : areas.find(a => a.slug === 'sen1floods11-ghana-demo') || areas[0];
+  const latest = await (await fetch(`${API}/study-areas/${demo.slug}/analyses/latest`)).json();
+  document.getElementById('meta').textContent =
+    ` | ${latest.analysis_label} | status=${latest.status} | obs=${(latest.observation_start || '').slice(0,10)} | model=${latest.model.version} | mask=${latest.permanent_water_mask.applied}`;
+  return latest.id;
+}
+
+async function addLayer(analysisId, key) {
+  const fc = await (await fetch(`${API}/analyses/${analysisId}/layers/${key}`)).json();
+  groups[key] = L.geoJSON(fc, { style: () => styles[key] }).addTo(map);
+  map.fitBounds(groups[key].getBounds(), { padding: [20, 20] });
+}
+
+loadLatest().then(id => {
+  for (const key of ['study_area', 'ml_flood', 'baseline_flood']) addLayer(id, key);
+  for (const [cbId, key] of [['cbArea', 'study_area'], ['cbMl', 'ml_flood'], ['cbOtsu', 'baseline_flood']]) {
+    document.getElementById(cbId).addEventListener('change', event => {
+      if (event.target.checked) { if (groups[key]) map.addLayer(groups[key]); }
+      else if (groups[key]) map.removeLayer(groups[key]);
+    });
+  }
+});
+</script>
+</body>
+</html>

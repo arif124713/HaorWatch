@@ -1,0 +1,14 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+backend/.env
+backend/data/
+backend/models/
+*.tif
+*.tiff
+*.pt
+*.zip
+.ipynb_checkpoints/
+node_modules/

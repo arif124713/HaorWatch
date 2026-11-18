@@ -1,0 +1,1 @@
+{"id": "dropper5/haorwatch-u-net-training", "title": "HaorWatch U-Net Training", "code_file": "train_haorwatch_unet.ipynb", "language": "python", "kernel_type": "notebook", "is_private": true, "enable_gpu": true, "enable_internet": true, "dataset_sources": [], "competition_sources": [], "kernel_sources": []}

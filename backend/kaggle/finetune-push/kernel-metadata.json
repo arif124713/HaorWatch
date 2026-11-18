@@ -1,0 +1,1 @@
+{"id": "dropper5/haorwatch-u-net-finetune-v04", "title": "HaorWatch U-Net Finetune v04", "code_file": "haorwatch_finetune_v04.ipynb", "language": "python", "kernel_type": "notebook", "is_private": true, "enable_gpu": true, "enable_internet": true, "dataset_sources": ["dropper5/hakaluki-v04-finetune"], "competition_sources": [], "kernel_sources": []}
