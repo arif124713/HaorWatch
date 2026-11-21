@@ -1,7 +1,10 @@
 from datetime import datetime, timezone
 
+from sqlalchemy import select
+
 from app.core.config import get_settings
 from app.core.exceptions import AppError
+from app.models import AnalysisRun
 from app.repositories.analysis import AnalysisRepository, utcnow
 from app.repositories.study_area import StudyAreaRepository
 from app.schemas.analysis import (
@@ -127,6 +130,17 @@ class AnalysisService:
         area = self.area_repo.get_by_slug(request.study_area_slug)
         if area is None:
             raise AppError("STUDY_AREA_NOT_FOUND", "Study area was not found.", 404)
+        busy = self.repo.db.scalars(
+            select(AnalysisRun).where(AnalysisRun.study_area_id == area.id).where(
+                AnalysisRun.status.in_(["queued", "processing"])
+            )
+        ).first()
+        if busy is not None:
+            raise AppError(
+                "ANALYSIS_ALREADY_RUNNING",
+                f"An analysis is already {busy.status} for this study area ({busy.id}).",
+                409,
+            )
         label = "Operator requested analysis"
         if request.observation_start and request.observation_end:
             label = f"Requested analysis {request.observation_start:%Y-%m-%d} to {request.observation_end:%Y-%m-%d}"
