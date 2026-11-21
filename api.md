@@ -189,6 +189,19 @@ Coordinates are illustrative placeholders. Return actual valid geometry. Support
 ```
 Null metrics mean unavailable, not zero. If no evaluation, methods may be empty and status `not_available`.
 
+`validation_status` is one of:
+- `not_available` — no validation reference available.
+- `internal_test_only` — internal held-out test evaluation only.
+- `operator_annotated_positive_only` — operator hand labels with **positive polygons only**; positive-class agreement, not a full binary classification validation (false positives outside drawn polygons are not observable).
+- `operator_annotated` — operator hand labels with both positive and negative annotations; full binary metrics.
+- `proxy_validated` — optical satellite (e.g. Sentinel-2 MNDWI) **proxy** comparison; not ground truth.
+- `external_reference_checked` — independent external reference (e.g. Copernicus EMS/UNOSAT) actually used.
+
+Metric definitions: positive class is `flood`; `precision = TP/(TP+FP)`, `recall = TP/(TP+FN)`, `F1 = 2TP/(2TP+FP+FN)`, `IoU = TP/(TP+FP+FN)`, computed over explicitly annotated/valid pixels only. Unannotated pixels are excluded and never treated as background.
+
+### Sentinel-1 observation semantics (provenance)
+Analysis detail (`processing_config.observation`) and sources record whether the SAR input is a single acquisition or a temporal composite, the compositing method, value domain (dB), image count, acquisition dates, orbit direction, polarisation, product/scene IDs, and the observation window. Multi-date mean composites are not single-date observations and do not represent peak flood extent.
+
 ### Data sources/provenance
 `GET /analyses/{analysis_id}/sources`
 ```json
@@ -244,7 +257,7 @@ Include only sources actually used. `status`: used/unavailable/reference_only.
 
 ### Trigger analysis (optional/operator only)
 `POST /admin/analyses` with `X-Operator-Key: <secret>`.
-Request:
+Request (live-data window):
 ```json
 {
   "study_area_slug": "pilot-haor",
@@ -255,11 +268,23 @@ Request:
   "run_exposure": true
 }
 ```
+Request (prepared data — explicit, separately validated workflow):
+```json
+{
+  "study_area_slug": "pilot-haor",
+  "prepared_dir": "data/prepared/hakaluki-live"
+}
+```
 Returns `202`:
 ```json
 {"analysis_id":"uuid","status":"queued","message":"Analysis request accepted."}
 ```
-Protect with operator key. If no queue is implemented, omit this endpoint and run pipeline via CLI.
+Validation rules:
+- A live-data run **requires** both `observation_start` and `observation_end`; otherwise `422 OBSERVATION_WINDOW_REQUIRED`. `observation_start` must be strictly before `observation_end` (`422 INVALID_OBSERVATION_WINDOW`).
+- `prepared_dir` must be an existing directory containing `s1.tif`; otherwise `422 PREPARED_BUNDLE_INVALID`.
+- A study area already `queued`/`processing` rejects a new trigger with `409 ANALYSIS_ALREADY_RUNNING`.
+- Every accepted run is executed by a background subprocess. The worker records the subprocess exit code, stdout, stderr, timeout, and launch status; failures are marked `failed` with a safe code (`SUBPROCESS_NONZERO_EXIT`, `SUBPROCESS_TIMEOUT`, `SUBPROCESS_LAUNCH_FAILED`) and a run that is not `queued` is never re-executed.
+- Protect with operator key. If no queue is implemented, omit this endpoint and run the pipeline via CLI.
 
 ## 3. Third-party integrations
 - **Sentinel-1:** obtain SAR via confirmed route such as Google Earth Engine or Copernicus Data Space. Record product IDs, acquisition date, polarization, orbit, preprocessing.

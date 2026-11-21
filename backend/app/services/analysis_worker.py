@@ -1,35 +1,129 @@
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 
+SUBPROCESS_TIMEOUT_SECONDS = 7200
+DB_CONNECT_TIMEOUT_SECONDS = 5
 
-def execute_run_subprocess(run_id: str, slug: str, start: str, end: str) -> None:
-    """Execute a queued analysis run in a subprocess (isolated from the API process)."""
-    command = [
-        sys.executable,
-        "-m",
-        "scripts.run_analysis",
-        "--slug",
-        slug,
-        "--start",
-        start,
-        "--end",
-        end,
-        "--run-id",
-        run_id,
-    ]
+
+def _bookkeeping_session_factory():
+    """A short-timeout session factory for worker bookkeeping.
+
+    The worker writes run status from the API process. Using a bounded connect
+    timeout means an unreachable database fails fast (and is reported) instead of
+    hanging the request that launched the background task.
+    """
+    from app.core.config import get_settings
+
+    engine = create_engine(
+        get_settings().database_url,
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": DB_CONNECT_TIMEOUT_SECONDS},
+    )
+    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+def _mark_run_failed(run_id: str, code: str, message: str, detail: str | None = None) -> None:
+    """Record a visible failure on the run so it never stays silently queued."""
     try:
-        subprocess.run(
+        import uuid as _uuid
+
+        from app.repositories.analysis import AnalysisRepository
+
+        factory = _bookkeeping_session_factory()
+        with factory() as db:
+            repo = AnalysisRepository(db)
+            run = repo.get(_uuid.UUID(run_id))
+            if run is None or run.status in ("completed", "failed"):
+                return
+            note = (detail or "")[:2000]
+            repo.update_run(
+                run,
+                status="failed",
+                error_code=code,
+                error_message_safe=message,
+                completed_at=datetime.now(timezone.utc),
+                progress_message=None,
+                processing_config={
+                    **(run.processing_config or {}),
+                    "subprocess_failure": {"code": code, "message": message, "detail": note},
+                },
+            )
+    except Exception:  # noqa: BLE001 - failure reporting must never raise
+        pass
+
+
+def execute_run_subprocess(
+    run_id: str,
+    slug: str,
+    start: str | None,
+    end: str | None,
+    prepared_dir: str | None = None,
+) -> None:
+    """Execute a queued analysis run in a subprocess (isolated from the API process).
+
+    Records the subprocess exit code, stdout, stderr, and timeout outcome so that
+    failures are visible through the API. If the subprocess fails to launch,
+    times out, or exits non-zero, the run is marked ``failed`` with a safe code.
+    A run that is already ``processing``/``completed``/``failed`` is not
+    re-executed, preventing duplicate work.
+    """
+    from app.repositories.analysis import AnalysisRepository
+    import uuid as _uuid
+
+    # Duplicate-execution guard: only a queued run may start.
+    try:
+        factory = _bookkeeping_session_factory()
+        with factory() as db:
+            repo = AnalysisRepository(db)
+            run = repo.get(_uuid.UUID(run_id))
+            if run is None:
+                return
+            if run.status != "queued":
+                return
+            repo.update_run(run, status="processing", progress_percent=1,
+                            progress_message="Subprocess launched")
+    except Exception:  # noqa: BLE001
+        pass
+
+    command = [sys.executable, "-m", "scripts.run_analysis", "--slug", slug, "--run-id", run_id]
+    if prepared_dir:
+        command += ["--prepared-dir", prepared_dir]
+    else:
+        command += ["--start", start, "--end", end]
+
+    try:
+        completed = subprocess.run(
             command,
             cwd=str(BACKEND_DIR),
             capture_output=True,
             text=True,
-            timeout=7200,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
-    except Exception:
-        # run_pipeline marks the run failed in the database on its own exceptions;
-        # a timeout or spawn failure leaves a failed/queued run that the operator
-        # can inspect via the API.
-        pass
+    except subprocess.TimeoutExpired as exc:
+        _mark_run_failed(
+            run_id,
+            "SUBPROCESS_TIMEOUT",
+            f"Analysis subprocess exceeded {SUBPROCESS_TIMEOUT_SECONDS}s.",
+            detail=(exc.stderr or "") if isinstance(exc.stderr, str) else None,
+        )
+        return
+    except OSError as exc:
+        _mark_run_failed(run_id, "SUBPROCESS_LAUNCH_FAILED", "Analysis subprocess could not be launched.",
+                         detail=str(exc))
+        return
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or "")[-2000:]
+        _mark_run_failed(
+            run_id,
+            "SUBPROCESS_NONZERO_EXIT",
+            f"Analysis subprocess exited with code {completed.returncode}.",
+            detail=detail,
+        )

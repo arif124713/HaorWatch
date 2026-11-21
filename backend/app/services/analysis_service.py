@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import select
 
@@ -130,6 +131,37 @@ class AnalysisService:
         area = self.area_repo.get_by_slug(request.study_area_slug)
         if area is None:
             raise AppError("STUDY_AREA_NOT_FOUND", "Study area was not found.", 404)
+
+        if request.prepared_dir:
+            prepared_path = Path(request.prepared_dir)
+            if not prepared_path.is_dir() or not (prepared_path / "s1.tif").exists():
+                raise AppError(
+                    "PREPARED_BUNDLE_INVALID",
+                    "prepared_dir must be an existing directory containing s1.tif.",
+                    422,
+                )
+            if request.observation_start or request.observation_end:
+                if (request.observation_start and request.observation_end
+                        and request.observation_start > request.observation_end):
+                    raise AppError("INVALID_OBSERVATION_WINDOW",
+                                   "observation_start must not be after observation_end.", 422)
+        else:
+            # Live-data runs require a complete, valid observation window; without
+            # it no imagery can be resolved and the run would sit queued forever.
+            if request.observation_start is None or request.observation_end is None:
+                raise AppError(
+                    "OBSERVATION_WINDOW_REQUIRED",
+                    "observation_start and observation_end are required for a live-data analysis. "
+                    "Supply both dates, or use prepared_dir for prepared-data execution.",
+                    422,
+                )
+            if request.observation_start >= request.observation_end:
+                raise AppError(
+                    "INVALID_OBSERVATION_WINDOW",
+                    "observation_start must be strictly before observation_end.",
+                    422,
+                )
+
         busy = self.repo.db.scalars(
             select(AnalysisRun).where(AnalysisRun.study_area_id == area.id).where(
                 AnalysisRun.status.in_(["queued", "processing"])
@@ -144,6 +176,8 @@ class AnalysisService:
         label = "Operator requested analysis"
         if request.observation_start and request.observation_end:
             label = f"Requested analysis {request.observation_start:%Y-%m-%d} to {request.observation_end:%Y-%m-%d}"
+        elif request.prepared_dir:
+            label = "Prepared-data analysis (operator requested)"
         run = self.repo.create_run(
             study_area_id=area.id,
             status="queued",
@@ -153,7 +187,8 @@ class AnalysisService:
             created_by="operator_api",
             processing_config={
                 "requested": request.model_dump(mode="json"),
-                "note": "Pipeline must be executed via scripts.run_analysis",
+                "execution_mode": "prepared" if request.prepared_dir else "live",
+                "note": "Pipeline is executed in a subprocess by the API worker.",
             },
         )
         return TriggerAccepted(

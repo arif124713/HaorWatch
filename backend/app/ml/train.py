@@ -9,7 +9,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from app.ml.dataset import Sen1Floods11ChipDataset, compute_dataset_stats, scan_assume_db
+from app.ml.dataset import Sen1Floods11ChipDataset, compute_dataset_stats, scan_declared_unit
+from app.ml.features import DEFAULT_SAR_UNIT
 from app.ml.evaluate import classification_metrics, confusion_counts, evaluate_mask, merge_confusion
 from app.ml.baseline import otsu_flood_mask
 from app.ml.unet import UNet
@@ -137,6 +138,8 @@ def main(argv=None):
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--s1-unit", default=None, choices=["dB", "linear"],
+                        help="Declared SAR input unit for the training chips (default: dB)")
     args = parser.parse_args(argv)
 
     data_dir = Path(args.data_dir)
@@ -168,11 +171,20 @@ def main(argv=None):
     if device.type == "cpu":
         print("WARNING: no CUDA device found. Training is intended for Kaggle GPU; CPU will be very slow.")
 
-    assume_db = scan_assume_db(image_dir, split_ids["train"])
-    stats_dataset = Sen1Floods11ChipDataset(image_dir, label_dir, split_ids["train"], assume_db=assume_db)
+    s1_unit = args.s1_unit or DEFAULT_SAR_UNIT
+    observed_unit = scan_declared_unit(image_dir, split_ids["train"])
+    if observed_unit != "unknown" and observed_unit != s1_unit:
+        raise SystemExit(
+            f"Declared --s1-unit={s1_unit!r} disagrees with observed training chips "
+            f"({observed_unit!r}). Refusing to train with a mismatched SAR unit; "
+            "resolve the dataset unit explicitly."
+        )
+    stats_dataset = Sen1Floods11ChipDataset(image_dir, label_dir, split_ids["train"], s1_unit=s1_unit)
     norm_stats = compute_dataset_stats(stats_dataset)
+    norm_stats["computed_on"] = "train_split_only"
+    norm_stats["s1_unit"] = s1_unit
 
-    config = {**TRAIN_CONFIG_DEFAULTS, "assume_db": assume_db, "norm_stats": norm_stats,
+    config = {**TRAIN_CONFIG_DEFAULTS, "s1_unit": s1_unit, "norm_stats": norm_stats,
               "band_order": ["VV_dB", "VH_dB"]}
     if args.epochs:
         config["epochs"] = args.epochs
@@ -185,7 +197,7 @@ def main(argv=None):
     loaders = {}
     for name in ("train", "val"):
         dataset = Sen1Floods11ChipDataset(
-            image_dir, label_dir, split_ids[name], norm_stats=norm_stats, assume_db=assume_db
+            image_dir, label_dir, split_ids[name], norm_stats=norm_stats, s1_unit=s1_unit
         )
         loaders[name] = DataLoader(
             dataset,
@@ -265,7 +277,7 @@ def main(argv=None):
     model.load_state_dict(checkpoint["state_dict"])
 
     val_loader = DataLoader(
-        Sen1Floods11ChipDataset(image_dir, label_dir, split_ids["val"], norm_stats=norm_stats, assume_db=assume_db),
+        Sen1Floods11ChipDataset(image_dir, label_dir, split_ids["val"], norm_stats=norm_stats, s1_unit=s1_unit),
         batch_size=config["batch_size"],
         num_workers=config["num_workers"],
     )
@@ -279,7 +291,7 @@ def main(argv=None):
             best_threshold = float(threshold)
 
     test_loader = DataLoader(
-        Sen1Floods11ChipDataset(image_dir, label_dir, split_ids["test"], norm_stats=norm_stats, assume_db=assume_db),
+        Sen1Floods11ChipDataset(image_dir, label_dir, split_ids["test"], norm_stats=norm_stats, s1_unit=s1_unit),
         batch_size=config["batch_size"],
         num_workers=config["num_workers"],
     )

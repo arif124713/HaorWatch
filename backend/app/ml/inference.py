@@ -6,7 +6,7 @@ import torch
 
 import rasterio
 from app.geospatial.raster_io import write_raster
-from app.ml.features import ensure_db, normalize
+from app.ml.features import DEFAULT_SAR_UNIT, band_to_db, normalize, normalize_unit
 from app.ml.unet import UNet
 
 DEFAULT_THRESHOLD = 0.5
@@ -29,7 +29,9 @@ def load_bundle(model_dir: str | Path) -> dict:
     model.load_state_dict(state_dict)
     model.eval()
     threshold = float(config.get("probability_threshold", DEFAULT_THRESHOLD))
-    return {"model": model, "config": config, "norm_stats": norm_stats, "threshold": threshold}
+    s1_unit = normalize_unit(config.get("s1_unit", norm_stats.get("s1_unit", DEFAULT_SAR_UNIT)))
+    return {"model": model, "config": config, "norm_stats": norm_stats,
+            "threshold": threshold, "s1_unit": s1_unit}
 
 
 def predict_tiles(model, image: np.ndarray, valid: np.ndarray, tile: int = TILE_SIZE,
@@ -62,10 +64,12 @@ def predict_raster(
     out_dir: str | Path,
     threshold: float | None = None,
     device: str | None = None,
+    s1_unit: str | None = None,
 ) -> dict:
     bundle = load_bundle(model_dir)
     model = bundle["model"]
     threshold = threshold if threshold is not None else bundle["threshold"]
+    unit = normalize_unit(s1_unit) if s1_unit is not None else bundle["s1_unit"]
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
@@ -74,10 +78,11 @@ def predict_raster(
         profile = src.profile
 
     converted = []
-    was_linear = False
+    unit_converted = False
     for band_index in range(data.shape[0]):
-        band, converted_flag = ensure_db(data[band_index])
-        was_linear = was_linear or converted_flag
+        band = band_to_db(data[band_index], unit)
+        if unit == "linear":
+            unit_converted = True
         converted.append(band)
     data = np.stack(converted)
 
@@ -103,6 +108,7 @@ def predict_raster(
         "probability_path": str(prob_path),
         "mask_path": str(mask_path),
         "threshold": threshold,
-        "unit_converted_to_db": was_linear,
+        "s1_unit": unit,
+        "unit_converted_to_db": unit_converted,
         "valid_pixel_count": int(valid.sum()),
     }

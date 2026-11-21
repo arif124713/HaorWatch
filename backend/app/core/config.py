@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     operator_api_key: str = "replace-with-long-random-secret"
     stale_after_days: int = 45
 
+    # JRC permanent-water occurrence threshold (percent, 0-100). Configurable so
+    # the permanent-water mask rule is explicit and adjustable per deployment.
+    permanent_water_occurrence_threshold: float = 95.0
+    # ESA WorldCover class IDs treated as mapped (non-crop-specific) cropland.
+    agricultural_class_ids: str = "40"
+
     google_earth_engine_project: str = ""
     copernicus_client_id: str = ""
     copernicus_client_secret: str = ""
@@ -32,6 +38,10 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def agricultural_class_list(self) -> list[int]:
+        return [int(v.strip()) for v in self.agricultural_class_ids.split(",") if v.strip()]
 
 
 @lru_cache

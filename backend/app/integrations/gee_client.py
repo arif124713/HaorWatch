@@ -32,6 +32,15 @@ class GEEClient:
         self.ee.Initialize(project=project)
 
     def s1_mosaic(self, aoi_geojson: dict, start: str, end: str, orbit: str | None = None):
+        """Build a Sentinel-1 VV/VH backscatter composite for the observation window.
+
+        Returns ``(image, meta)``. ``meta`` explicitly documents that the returned
+        image is a **temporal mean composite** of multiple acquisitions, not a
+        single scene, together with the count, product IDs, acquisition dates,
+        orbit direction, polarisation, and compositing method. Downstream code
+        must surface this so results are never described as a single-date
+        observation.
+        """
         ee = self.ee
         collection = (
             ee.ImageCollection(S1_COLLECTION)
@@ -49,16 +58,38 @@ class GEEClient:
                 "S1_UNAVAILABLE", "No Sentinel-1 imagery found for the requested period.", 503
             )
         product_ids = collection.limit(50).aggregate_array("system:id").getInfo()
+        acquisition_millis = collection.limit(50).aggregate_array("system:time_start").getInfo()
+        import datetime as _dt
+
+        acquisition_dates = sorted(
+            {
+                _dt.datetime.fromtimestamp(ms / 1000.0, tz=_dt.timezone.utc).strftime("%Y-%m-%d")
+                for ms in (acquisition_millis or [])
+                if ms is not None
+            }
+        )
         mosaic = collection.mean()
-        return mosaic, {
+        meta = {
             "collection": S1_COLLECTION,
+            "observation_type": "temporal_composite",
+            "compositing_method": "mean",
+            "value_domain": "dB",
             "image_count": image_count,
-            "composite": "mean_dB",
-            "bands": ["VV", "VH"],
             "product_ids": product_ids,
+            "acquisition_dates": acquisition_dates,
+            "orbit_direction": orbit,
+            "polarisation": ["VV", "VH"],
+            "period_start": start,
+            "period_end": end,
+            "bands": ["VV", "VH"],
             "start": start,
             "end": end,
+            "note": (
+                "Multi-date temporal mean composite. NOT a single-date observation and NOT a "
+                "peak-flood-extent product; the mean can smooth or damp transient flood peaks."
+            ),
         }
+        return mosaic, meta
 
     def jrc_occurrence(self, aoi_geojson: dict):
         image = self.ee.Image(JRC_COLLECTION).select("occurrence")

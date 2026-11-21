@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.deps import (
+    get_analysis_runner,
     get_analysis_service,
     get_layer_service,
     get_provenance_service,
@@ -202,6 +203,7 @@ def client(latest_response):
     ]
     app = create_app()
     app.dependency_overrides[get_study_area_service] = lambda: FakeStudyAreaService(areas=[area])
+    app.dependency_overrides[get_analysis_runner] = lambda: (lambda **kwargs: None)
     app.dependency_overrides[get_analysis_service] = lambda: FakeAnalysisService(latest=latest_response)
     app.dependency_overrides[get_layer_service] = lambda: FakeLayerService(
         catalogue=LayerCatalogueResponse(analysis_id=latest_response.id, layers=layer_items),

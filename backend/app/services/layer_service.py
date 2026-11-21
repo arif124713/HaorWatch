@@ -19,8 +19,9 @@ LAYER_DEFS = {
         "description": "Flood-class pixels from documented SAR thresholding baseline.",
     },
     "agricultural_exposure": {
-        "display_name": "Potentially exposed agricultural land",
-        "description": "Intersection of detected flood extent and selected agricultural land-cover classes.",
+        "display_name": "Mapped cropland potentially exposed to detected water",
+        "description": "Intersection of detected water extent and ESA WorldCover mapped cropland "
+                       "(class 40). Not confirmed crop damage and not crop-specific.",
     },
     "permanent_water": {
         "display_name": "Permanent water mask",

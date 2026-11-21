@@ -16,8 +16,16 @@ from app.core.config import get_settings
 from app.core.database import get_session_factory
 from app.core.exceptions import AppError, ProviderUnavailableError
 from app.geospatial.area import mask_area_km2, projected_area_km2
+from app.geospatial.grid import (
+    AnalysisGrid,
+    GridMismatchError,
+    align_to_grid,
+    assert_grids_match,
+    grid_from_profile,
+    validate_many,
+)
 from app.geospatial.masks import apply_permanent_water, compute_valid
-from app.geospatial.reprojection import grid_for_bounds, reproject_array, reproject_geometry, utm_epsg_for
+from app.geospatial.reprojection import grid_for_bounds, reproject_geometry, utm_epsg_for
 from app.geospatial.raster_io import read_bands, read_single, write_raster
 from app.geospatial.vectorize import ensure_multipolygon, mask_to_geometry, simplify_if_large
 from app.integrations.gee_client import GEEClient
@@ -27,17 +35,18 @@ from app.ml.model_registry import resolve_model_dir
 from app.repositories.analysis import AnalysisRepository
 from app.repositories.study_area import StudyAreaRepository
 
-PERMANENT_WATER_THRESHOLD = 95.0
-AGRICULTURAL_CLASSES = [40]
+# Permanent-water threshold and cropland classes are configurable via Settings
+# (permanent_water_occurrence_threshold, agricultural_class_ids).
 WORLDCOVER_SOURCE = {
     "dataset_key": "esa_worldcover",
     "display_name": "ESA WorldCover",
     "provider": "European Space Agency",
-    "role": "Agricultural land-cover overlay",
+    "role": "Mapped cropland overlay (class 40)",
     "version": "v200 (2021)",
     "resolution_m": 10.0,
     "status": "used",
-    "notes": "Cropland class 40; land-cover class is not crop-specific.",
+    "notes": "WorldCover class 40 is 'Cropland'. It is a land-cover class, not a crop-specific "
+             "(e.g. Boro rice) classification, and is not confirmed cultivation or crop damage.",
 }
 
 
@@ -121,6 +130,8 @@ def run_pipeline(study_area_slug: str, start: str, end: str, run_id: str | None 
 
 
 def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, prepared_dir, settings):
+    permanent_water_threshold = float(settings.permanent_water_occurrence_threshold)
+    agricultural_classes = list(settings.agricultural_class_list)
     boundary = area.boundary if isinstance(area.boundary, shapely.geometry.base.BaseGeometry) else to_shape(area.boundary)
     geom_wgs84 = ensure_multipolygon(boundary)
     if geom_wgs84 is None or geom_wgs84.is_empty:
@@ -135,6 +146,8 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
     repo.update_run(run, progress_percent=10, progress_message="Resolving input imagery")
 
     sources = []
+    manifest = {}
+    observation = None
     if prepared_dir:
         s1_path = Path(prepared_dir) / "s1.tif"
         jrc_path = Path(prepared_dir) / "jrc_occurrence.tif"
@@ -142,6 +155,7 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
         manifest_path = Path(prepared_dir) / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
         sources = list(manifest.get("sources", []))
+        observation = manifest.get("observation")
         prepared_note = "Prepared/precomputed input bundle."
         jrc_available = jrc_path.exists()
         wc_available = wc_path.exists()
@@ -180,10 +194,27 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
             "display_name": "Sentinel-1 SAR",
             "provider": "Copernicus",
             "role": "Flood detection input imagery",
-            **{k: v for k, v in s1_meta.items() if k in ("version", "resolution_m", "crs", "source_url")},
+            "version": s1_meta.get("collection"),
+            "period_start": (start[:10] if start else None),
+            "period_end": (end[:10] if end else None),
+            "resolution_m": 10.0,
+            "crs": utm_crs,
             "status": "used",
             "notes": json.dumps(s1_meta),
         })
+        observation = {
+            "type": s1_meta.get("observation_type", "temporal_composite"),
+            "compositing_method": s1_meta.get("compositing_method"),
+            "value_domain": s1_meta.get("value_domain"),
+            "image_count": s1_meta.get("image_count"),
+            "acquisition_dates": s1_meta.get("acquisition_dates"),
+            "orbit_direction": s1_meta.get("orbit_direction"),
+            "polarisation": s1_meta.get("polarisation"),
+            "period_start": start,
+            "period_end": end,
+            "product_ids": s1_meta.get("product_ids"),
+            "note": s1_meta.get("note"),
+        }
 
         repo.update_run(run, progress_percent=40, progress_message="Exporting permanent-water and land-cover")
         jrc_image, jrc_meta = client.jrc_occurrence(mapping(geom_wgs84))
@@ -206,33 +237,42 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
 
     repo.update_run(run, progress_percent=55, progress_message="Aligning rasters")
 
+    # Authoritative analysis grid: UTM CRS, 10 m pixels, fixed origin/size for
+    # the study-area bounds. All rasters are aligned to this exact grid.
     s1_data, s1_profile = read_bands(s1_path)
-    vv, vh = s1_data[0], s1_data[1]
-    if abs(s1_profile["transform"].a) <= 1.0:
-        from app.geospatial.reprojection import reproject_array
-        from pyproj import CRS as _CRS
-
-        dst_transform, dst_shape = grid_for_bounds(bounds, epsg, 10.0)
-        vv = reproject_array(vv, s1_profile["transform"], _CRS.from_user_input(s1_profile["crs"]), dst_transform, utm_crs, dst_shape)
-        vh = reproject_array(vh, s1_profile["transform"], _CRS.from_user_input(s1_profile["crs"]), dst_transform, utm_crs, dst_shape)
-        s1_transform, s1_shape = dst_transform, dst_shape
-    else:
-        s1_transform, s1_shape = s1_profile["transform"], vv.shape
+    target_grid = AnalysisGrid(
+        crs=utm_crs,
+        transform=transform,
+        width=int(grid_shape[1]),
+        height=int(grid_shape[0]),
+        resolution_m=10.0,
+        nodata=np.nan,
+    )
+    s1_grid = grid_from_profile(s1_profile, resolution_m=10.0)
+    vv = align_to_grid(s1_data[0], s1_grid, target_grid, categorical=False)
+    vh = align_to_grid(s1_data[1], s1_grid, target_grid, categorical=False)
+    s1_transform, s1_shape = target_grid.transform, target_grid.shape
 
     jrc_data = None
     if jrc_available:
         jrc_data, jrc_profile = read_single(jrc_path)
-        if abs(jrc_profile["transform"].a) <= 1.0 or jrc_profile["transform"].a != s1_transform.a:
-            from pyproj import CRS as _CRS
-
-            jrc_data = reproject_array(jrc_data, jrc_profile["transform"], _CRS.from_user_input(jrc_profile["crs"]), s1_transform, utm_crs, s1_shape)
+        jrc_grid = grid_from_profile(jrc_profile, resolution_m=10.0)
+        jrc_data = align_to_grid(jrc_data, jrc_grid, target_grid, categorical=True)
     wc_data = None
     if wc_available:
         wc_data, wc_profile = read_single(wc_path)
-        if abs(wc_profile["transform"].a) <= 1.0 or wc_profile["transform"].a != s1_transform.a:
-            from pyproj import CRS as _CRS
+        wc_grid = grid_from_profile(wc_profile, resolution_m=10.0)
+        wc_data = align_to_grid(wc_data, wc_grid, target_grid, categorical=True)
 
-            wc_data = reproject_array(wc_data, wc_profile["transform"], _CRS.from_user_input(wc_profile["crs"]), s1_transform, utm_crs, s1_shape)
+    # Explicit alignment assertion before any pixel-wise operation.
+    check_grids = {"sentinel1": target_grid}
+    if jrc_data is not None:
+        check_grids["jrc"] = AnalysisGrid(utm_crs, s1_transform, int(s1_shape[1]), int(s1_shape[0]), 10.0)
+    validate_many(check_grids)
+    if jrc_data is not None and jrc_data.shape != s1_shape:
+        raise GridMismatchError("JRC raster is not aligned to the analysis grid.")
+    if wc_data is not None and wc_data.shape != s1_shape:
+        raise GridMismatchError("WorldCover raster is not aligned to the analysis grid.")
 
     valid = compute_valid(vv, vh)
     from rasterio.features import rasterize
@@ -252,6 +292,18 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
     total_pixels = int(vv.size)
     nodata_count = total_pixels - valid_count
 
+    # Write the preprocessed SAR onto the analysis grid. U-Net inference and the
+    # Otsu baseline both consume this exact raster so they share one observation.
+    s1_unit = (manifest.get("s1_unit") if prepared_dir else None) or "dB"
+    preprocessed_path = write_raster(
+        run_dir / "s1_preprocessed.tif",
+        np.stack([vv.astype(np.float32), vh.astype(np.float32)]),
+        s1_transform,
+        utm_crs,
+        dtype="float32",
+        nodata=np.nan,
+    )
+
     repo.update_run(run, progress_percent=65, progress_message="Computing Otsu baseline")
     baseline_mask, baseline_threshold = otsu_flood_mask(vh, valid, water_is_low=True)
     baseline_area = mask_area_km2(baseline_mask, s1_transform)
@@ -262,32 +314,30 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
     ml_mask = None
     if model_dir:
         repo.update_run(run, progress_percent=75, progress_message="Running custom ML model")
-        inference_result = predict_raster(model_dir, s1_path, run_dir)
+        inference_result = predict_raster(
+            model_dir, preprocessed_path, run_dir, s1_unit=s1_unit
+        )
         ml_mask_data, ml_profile = read_single(inference_result["mask_path"])
-        if ml_mask_data.shape != s1_shape:
-            from pyproj import CRS as _CRS
-
-            ml_mask_data = reproject_array(
-                ml_mask_data, ml_profile["transform"], _CRS.from_user_input(ml_profile["crs"]),
-                s1_transform, utm_crs, s1_shape,
-            )
+        ml_grid = grid_from_profile(ml_profile, resolution_m=10.0)
+        target_grid = AnalysisGrid(utm_crs, s1_transform, int(s1_shape[1]), int(s1_shape[0]), 10.0)
+        assert_grids_match(target_grid, ml_grid, label="ml_inference_output")
         ml_mask = ml_mask_data > 0.5
         ml_mask &= valid
 
     mask_applied = jrc_data is not None and jrc_data.shape == s1_shape
     if ml_mask is not None:
-        flood_mask = apply_permanent_water(ml_mask, jrc_data if mask_applied else None, PERMANENT_WATER_THRESHOLD)
+        flood_mask = apply_permanent_water(ml_mask, jrc_data if mask_applied else None, permanent_water_threshold)
     else:
         flood_mask = None
 
     baseline_mask = apply_permanent_water(
-        baseline_mask, jrc_data if mask_applied else None, PERMANENT_WATER_THRESHOLD
+        baseline_mask, jrc_data if mask_applied else None, permanent_water_threshold
     )
     detected_area = mask_area_km2(flood_mask, s1_transform) if flood_mask is not None else None
 
     repo.update_run(run, progress_percent=85, progress_message="Computing agricultural exposure")
     agri_mask = (
-        np.isin(wc_data.astype(np.int32), AGRICULTURAL_CLASSES) & valid
+        np.isin(wc_data.astype(np.int32), agricultural_classes) & valid
         if wc_data is not None and wc_data.shape == s1_shape
         else None
     )
@@ -314,7 +364,7 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
         ("baseline_flood", _mask_to_wgs84(baseline_mask, s1_transform, utm_crs), baseline_area, baseline_mask.any()),
         ("agricultural_exposure", _mask_to_wgs84(exposure_mask, s1_transform, utm_crs), exposed_area, exposure_mask is not None),
         ("permanent_water", _mask_to_wgs84(
-            (jrc_data >= PERMANENT_WATER_THRESHOLD) & np.isfinite(jrc_data) & aoi_mask
+            (jrc_data >= permanent_water_threshold) & np.isfinite(jrc_data) & aoi_mask
             if mask_applied else None,
             s1_transform, utm_crs), None, mask_applied),
     ]
@@ -352,18 +402,29 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
                 "utm_epsg": epsg,
                 "resolution_m": 10.0,
                 "baseline_threshold": baseline_threshold,
-                "permanent_water_threshold": PERMANENT_WATER_THRESHOLD if mask_applied else None,
+                "permanent_water_threshold": permanent_water_threshold if mask_applied else None,
                 "prepared_note": prepared_note,
+                "observation_type": (observation or {}).get("type"),
+                "observation_note": (observation or {}).get("note"),
+                "not_peak_flood_extent": True,
+                "permanent_water_rule": (
+                    f"JRC occurrence >= {permanent_water_threshold}" if mask_applied else "not applied"
+                ),
+                "mapped_cropland_classes": agricultural_classes,
+                "mapped_cropland_class_name": "ESA WorldCover class 40 (Cropland)",
+                "exposure_terminology": "Mapped Cropland Potentially Exposed to Detected Water",
+                "confirmed_crop_damage": False,
             },
         )
     )
 
     processing_config = {
         "sources": sources,
+        "observation": observation,
         "permanent_water": {
             "applied": mask_applied,
             "source": "JRC Global Surface Water v1.4" if mask_applied else None,
-            "threshold": PERMANENT_WATER_THRESHOLD if mask_applied else None,
+            "threshold": permanent_water_threshold if mask_applied else None,
             "rule": "occurrence >= threshold treated as permanent water",
             "note": None if mask_applied else "Permanent-water mask was not available for this run.",
         },        "baseline": {
@@ -377,7 +438,7 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
             "probability_threshold": None,
             "note": "Custom U-Net checkpoint was not available; ML layer omitted." if not model_dir else None,
         },
-        "agricultural_classes": AGRICULTURAL_CLASSES,
+        "agricultural_classes": agricultural_classes,
         "utm_epsg": epsg,
         "prepared_bundle": prepared_note,
     }
@@ -393,7 +454,7 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
         model_version=_model_version(model_dir) if has_ml else None,
         baseline_method="otsu_thresholding",
         permanent_water_mask_applied=mask_applied,
-        permanent_water_threshold=PERMANENT_WATER_THRESHOLD if mask_applied else None,
+        permanent_water_threshold=permanent_water_threshold if mask_applied else None,
         processing_config=processing_config,
     )
 

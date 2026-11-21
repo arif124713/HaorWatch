@@ -145,6 +145,7 @@ class TriggerAnalysisRequest(BaseModel):
     study_area_slug: str
     observation_start: datetime | None = None
     observation_end: datetime | None = None
+    prepared_dir: str | None = None
     run_ml: bool = True
     run_baseline: bool = True
     run_exposure: bool = True

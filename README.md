@@ -44,3 +44,19 @@ Frontend integration should be possible using the API contract alone. Do not bui
 
 ## Required model decision
 U-Net is the primary custom model for this MVP. Sen1Floods11 is the primary dataset candidate and must be audited before training. Random Forest is optional, not a replacement for the U-Net requirement. Work within the available GPU quota (approximately 30 GPU-hours/week if applicable); prioritize a reproducible run, checkpointing, held-out evaluation, and error analysis over broad hyperparameter sweeps.
+
+## Technical correctness & reliability notes
+- **SAR units are explicit and deterministic.** Model bundles declare `s1_unit` (`dB`/`linear`); units are never inferred from pixel medians; missing units raise an error. Training and inference share one preprocessing definition.
+- **One common analysis grid.** Preprocessed SAR, U-Net, Otsu, JRC, and WorldCover are aligned to a single `AnalysisGrid` (CRS, transform, dimensions, resolution, nodata) that is validated before pixel-wise operations.
+- **Annotation-aware metrics.** Hand-label evaluation distinguishes positive/negative/unannotated pixels; unannotated pixels are never treated as background, and positive-only annotations are not claimed as full binary validation.
+- **Observation semantics** (single vs temporal mean composite, image count, dates, orbit, polarisation, product IDs) are recorded and surfaced; composites are not described as single-date observations or peak flood extent.
+- **Analysis jobs** cannot remain silently queued: a live run requires both observation dates (or an explicit `prepared_dir`), and the subprocess worker records exit code/stdout/stderr/timeout and marks failures visibly.
+- **Validation categories** (operator annotation, optical proxy, independent external reference) are kept distinct; ESA WorldCover class 40 is "mapped cropland", and exposure is reported as "Mapped Cropland Potentially Exposed to Detected Water", never confirmed crop damage.
+- API routes are registered once under `/api/v1`; each run executes once.
+
+### Tests
+```bash
+cd backend
+python -m pytest -q
+```
+
