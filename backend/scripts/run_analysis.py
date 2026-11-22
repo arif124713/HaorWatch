@@ -30,6 +30,7 @@ from app.geospatial.raster_io import read_bands, read_single, write_raster
 from app.geospatial.vectorize import ensure_multipolygon, mask_to_geometry, simplify_if_large
 from app.integrations.gee_client import GEEClient
 from app.ml.baseline import otsu_flood_mask
+from app.ml.features import band_to_db, normalize_unit
 from app.ml.inference import predict_raster
 from app.ml.model_registry import resolve_model_dir
 from app.repositories.analysis import AnalysisRepository
@@ -248,7 +249,7 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
         resolution_m=10.0,
         nodata=np.nan,
     )
-    s1_grid = grid_from_profile(s1_profile, resolution_m=10.0)
+    s1_grid = grid_from_profile(s1_profile, resolution_m=10.0, require_projected=False)
     vv = align_to_grid(s1_data[0], s1_grid, target_grid, categorical=False)
     vh = align_to_grid(s1_data[1], s1_grid, target_grid, categorical=False)
     s1_transform, s1_shape = target_grid.transform, target_grid.shape
@@ -256,12 +257,12 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
     jrc_data = None
     if jrc_available:
         jrc_data, jrc_profile = read_single(jrc_path)
-        jrc_grid = grid_from_profile(jrc_profile, resolution_m=10.0)
+        jrc_grid = grid_from_profile(jrc_profile, resolution_m=10.0, require_projected=False)
         jrc_data = align_to_grid(jrc_data, jrc_grid, target_grid, categorical=True)
     wc_data = None
     if wc_available:
         wc_data, wc_profile = read_single(wc_path)
-        wc_grid = grid_from_profile(wc_profile, resolution_m=10.0)
+        wc_grid = grid_from_profile(wc_profile, resolution_m=10.0, require_projected=False)
         wc_data = align_to_grid(wc_data, wc_grid, target_grid, categorical=True)
 
     # Explicit alignment assertion before any pixel-wise operation.
@@ -292,9 +293,24 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
     total_pixels = int(vv.size)
     nodata_count = total_pixels - valid_count
 
-    # Write the preprocessed SAR onto the analysis grid. U-Net inference and the
-    # Otsu baseline both consume this exact raster so they share one observation.
-    s1_unit = (manifest.get("s1_unit") if prepared_dir else None) or "dB"
+    # Declared SAR unit is mandatory. Prepared bundles must declare it in
+    # manifest.json; live GEE exports are dB backscatter by construction.
+    if prepared_dir:
+        if "s1_unit" not in manifest:
+            raise SystemExit(
+                "Prepared bundle manifest.json must declare 's1_unit' ('dB' or 'linear'); "
+                "refusing to guess Sentinel-1 units."
+            )
+        s1_unit = normalize_unit(manifest["s1_unit"])
+    else:
+        s1_unit = "dB"
+    if s1_unit != "dB" and s1_unit != "linear":
+        raise SystemExit(f"Unsupported declared s1_unit {s1_unit!r}.")
+
+    # Write the preprocessed SAR onto the analysis grid in its DECLARED unit.
+    # U-Net inference and the Otsu baseline both consume this exact raster, and
+    # both apply band_to_db() using the same declared unit, so dB conversion
+    # happens exactly once.
     preprocessed_path = write_raster(
         run_dir / "s1_preprocessed.tif",
         np.stack([vv.astype(np.float32), vh.astype(np.float32)]),
@@ -305,18 +321,20 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
     )
 
     repo.update_run(run, progress_percent=65, progress_message="Computing Otsu baseline")
-    baseline_mask, baseline_threshold = otsu_flood_mask(vh, valid, water_is_low=True)
+    baseline_mask, baseline_threshold = otsu_flood_mask(band_to_db(vh, s1_unit), valid, water_is_low=True)
     baseline_area = mask_area_km2(baseline_mask, s1_transform)
 
     model_dir = model_dir or (
         str(resolve_model_dir(settings.model_root)) if resolve_model_dir(settings.model_root) else None
     )
     ml_mask = None
+    probability_threshold = None
     if model_dir:
         repo.update_run(run, progress_percent=75, progress_message="Running custom ML model")
         inference_result = predict_raster(
             model_dir, preprocessed_path, run_dir, s1_unit=s1_unit
         )
+        probability_threshold = inference_result.get("threshold")
         ml_mask_data, ml_profile = read_single(inference_result["mask_path"])
         ml_grid = grid_from_profile(ml_profile, resolution_m=10.0)
         target_grid = AnalysisGrid(utm_crs, s1_transform, int(s1_shape[1]), int(s1_shape[0]), 10.0)
@@ -414,6 +432,8 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
                 "mapped_cropland_class_name": "ESA WorldCover class 40 (Cropland)",
                 "exposure_terminology": "Mapped Cropland Potentially Exposed to Detected Water",
                 "confirmed_crop_damage": False,
+                "sar_unit": s1_unit,
+                "sar_converted_to_db": s1_unit == "linear",
             },
         )
     )
@@ -421,13 +441,29 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
     processing_config = {
         "sources": sources,
         "observation": observation,
+        "sar_input": {
+            "declared_unit": s1_unit,
+            "converted_to_db": s1_unit == "linear",
+            "conversion": "10*log10(clip(linear,1e-6,None))" if s1_unit == "linear" else "none",
+            "preprocessed_raster": "s1_preprocessed.tif",
+            "units_never_inferred": True,
+        },
+        "grid": {
+            "crs": utm_crs,
+            "transform": list(s1_transform)[:6],
+            "width": int(s1_shape[1]),
+            "height": int(s1_shape[0]),
+            "resolution_m": 10.0,
+            "nodata": "nan",
+        },
         "permanent_water": {
             "applied": mask_applied,
             "source": "JRC Global Surface Water v1.4" if mask_applied else None,
             "threshold": permanent_water_threshold if mask_applied else None,
             "rule": "occurrence >= threshold treated as permanent water",
             "note": None if mask_applied else "Permanent-water mask was not available for this run.",
-        },        "baseline": {
+        },
+        "baseline": {
             "method": "otsu_thresholding",
             "band": "VH_dB",
             "water_is_low": True,
@@ -435,12 +471,17 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
         },
         "ml": {
             "model_dir": model_dir,
-            "probability_threshold": None,
+            "model_version": _model_version(model_dir) if model_dir else None,
+            "checkpoint_sha256": _checkpoint_hash(model_dir) if model_dir else None,
+            "probability_threshold": probability_threshold,
             "note": "Custom U-Net checkpoint was not available; ML layer omitted." if not model_dir else None,
         },
         "agricultural_classes": agricultural_classes,
+        "worldcover_version": "v200 (2021)",
+        "agricultural_class_name": "ESA WorldCover class 40 (Cropland)",
         "utm_epsg": epsg,
         "prepared_bundle": prepared_note,
+        "code_git_sha": _git_sha(),
     }
 
     has_ml = model_dir is not None
@@ -480,6 +521,39 @@ def _model_version(model_dir: str | None) -> str | None:
             return json.loads(config.read_text(encoding="utf-8")).get("model_version")
         except json.JSONDecodeError:
             return None
+    return None
+
+
+def _checkpoint_hash(model_dir: str | None) -> str | None:
+    if not model_dir:
+        return None
+    checkpoint = Path(model_dir) / "checkpoint.pt"
+    if not checkpoint.exists():
+        return None
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(checkpoint, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_sha() -> str | None:
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception:  # noqa: BLE001
+        return None
     return None
 
 

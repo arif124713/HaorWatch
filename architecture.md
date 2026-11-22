@@ -53,13 +53,19 @@ Frontend does not perform raster processing or ML inference.
 - Apply and document orbit correction, border/thermal noise handling, calibration, terrain correction, and speckle filtering choices as applicable.
 - Align rasters before pixel-wise comparisons.
 - Handle nodata explicitly; do not silently mix dB and linear units.
-- **SAR units are explicit and deterministic.** The band unit (`dB` or `linear`) is declared in the model bundle `config.json` (`s1_unit`) and in dataset/inference configuration. Units are **never** inferred from pixel medians. Missing/unknown units raise a clear error. Training, validation, and inference use the same declared unit and identical preprocessing.
+- **SAR units are explicit and deterministic.** The band unit (`dB` or `linear`) is declared in the model bundle `config.json` (`s1_unit`) and in dataset/inference configuration. Units are **never** inferred from pixel medians. Missing/unknown units raise a clear error, and a bundle whose `config.json` and `norm_stats.json` disagree is rejected. Training, validation, and inference use the same declared unit and identical preprocessing, and dB conversion is applied exactly once. Prepared analysis bundles must declare `s1_unit` in `manifest.json`.
 - **Observation semantics are explicit.** An analysis records whether the Sentinel-1 input is a single acquisition or a temporal composite, the compositing method (mean), value domain (dB), image count, acquisition dates, orbit direction, polarisation, and product/scene IDs. A multi-date mean composite is not a single-date observation and does not represent peak flood extent.
+- **GEE export tiling is projected-CRS based.** Export tiles are computed in the target projected CRS so each tile covers a constant ground area at any latitude; degree-based tiling would shrink ground coverage with latitude. Multi-tile mosaics reject inconsistent tile CRS.
 
 ### Common analysis grid
 - `app/geospatial/grid.py` defines one authoritative `AnalysisGrid` (CRS, affine transform, width, height, pixel resolution, nodata) per run.
 - Preprocessed SAR, U-Net output, Otsu baseline, JRC, and WorldCover are aligned to that exact grid. Alignment is validated on CRS, transform, dimensions, and pixel origin **before** any pixel-wise operation; `GridMismatchError` is raised on incompatibility. Matching array shapes alone is never treated as alignment.
-- Categorical rasters (WorldCover class IDs, JRC) use nearest-neighbour resampling; interpolating class IDs is not allowed.
+- Categorical rasters (WorldCover class IDs, JRC) use nearest-neighbour resampling; continuous SAR bands use an explicit continuous method (default bilinear). The choice is always explicit, never implicit.
+- Source NaN and declared source nodata are excluded from resampling and can never become valid zero-valued observations; destination pixels with no valid source keep the destination nodata.
+- Rotated/sheared transforms are rejected; source arrays must match their declared grid dimensions.
+
+### Background job execution limits
+- Analysis runs execute in a subprocess launched from a FastAPI `BackgroundTasks` callback. This is sufficient for the MVP but has known limitations for long-running production use: the task runs in the API process, there is no queue, no retry, no horizontal scaling, and if the API process is killed mid-run the run can remain `processing` with no automatic recovery. A production deployment should move to a real job runner. This is documented rather than replaced to avoid adding uncontrolled infrastructure.
 
 ### Permanent-water mask
 - Use JRC Global Surface Water with documented product/version and chosen occurrence/seasonality rule.

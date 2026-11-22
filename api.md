@@ -202,6 +202,15 @@ Metric definitions: positive class is `flood`; `precision = TP/(TP+FP)`, `recall
 ### Sentinel-1 observation semantics (provenance)
 Analysis detail (`processing_config.observation`) and sources record whether the SAR input is a single acquisition or a temporal composite, the compositing method, value domain (dB), image count, acquisition dates, orbit direction, polarisation, product/scene IDs, and the observation window. Multi-date mean composites are not single-date observations and do not represent peak flood extent.
 
+### Reproducibility metadata (analysis detail `processing_config`)
+- `sar_input`: `declared_unit` (`dB`/`linear`), `converted_to_db`, conversion formula, preprocessed raster name, `units_never_inferred`.
+- `grid`: `crs`, `transform`, `width`, `height`, `resolution_m`, `nodata`.
+- `ml`: `model_dir`, `model_version`, `checkpoint_sha256`, `probability_threshold`.
+- `code_git_sha`: pipeline commit SHA (null if unavailable).
+- `permanent_water`: applied flag, JRC source/version, occurrence threshold, rule.
+- `agricultural_classes`, `worldcover_version`, `agricultural_class_name`.
+Missing metadata is returned as `null`/unavailable, never fabricated.
+
 ### Data sources/provenance
 `GET /analyses/{analysis_id}/sources`
 ```json

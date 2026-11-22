@@ -6,12 +6,37 @@ import torch
 
 import rasterio
 from app.geospatial.raster_io import write_raster
-from app.ml.features import DEFAULT_SAR_UNIT, band_to_db, normalize, normalize_unit
+from app.ml.features import SarUnitError, band_to_db, normalize, normalize_unit
 from app.ml.unet import UNet
 
 DEFAULT_THRESHOLD = 0.5
 TILE_SIZE = 512
 TILE_STRIDE = 256
+
+
+def _resolve_bundle_unit(config: dict, norm_stats: dict, model_dir: Path) -> str:
+    """Resolve the declared SAR unit from a model bundle, rejecting conflicts.
+
+    A production model bundle must declare its SAR input unit. The unit is read
+    from ``config.json`` (``s1_unit``) and/or ``norm_stats.json`` (``s1_unit``).
+    If both are present they must agree; if neither is present the bundle is
+    rejected rather than silently assuming dB, because that could apply the
+    wrong conversion and corrupt predictions.
+    """
+    config_unit = config.get("s1_unit")
+    stats_unit = norm_stats.get("s1_unit")
+    if config_unit is None and stats_unit is None:
+        raise SarUnitError(
+            f"Model bundle {model_dir} does not declare a SAR input unit. "
+            "Add 's1_unit' ('dB' or 'linear') to config.json (and norm_stats.json)."
+        )
+    if config_unit is not None and stats_unit is not None:
+        if normalize_unit(config_unit) != normalize_unit(stats_unit):
+            raise SarUnitError(
+                f"Model bundle {model_dir} declares conflicting SAR units: "
+                f"config.json s1_unit={config_unit!r} vs norm_stats.json s1_unit={stats_unit!r}."
+            )
+    return normalize_unit(config_unit if config_unit is not None else stats_unit)
 
 
 def load_bundle(model_dir: str | Path) -> dict:
@@ -29,7 +54,7 @@ def load_bundle(model_dir: str | Path) -> dict:
     model.load_state_dict(state_dict)
     model.eval()
     threshold = float(config.get("probability_threshold", DEFAULT_THRESHOLD))
-    s1_unit = normalize_unit(config.get("s1_unit", norm_stats.get("s1_unit", DEFAULT_SAR_UNIT)))
+    s1_unit = _resolve_bundle_unit(config, norm_stats, directory)
     return {"model": model, "config": config, "norm_stats": norm_stats,
             "threshold": threshold, "s1_unit": s1_unit}
 

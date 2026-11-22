@@ -14,7 +14,14 @@ import torch
 from rasterio.transform import Affine
 
 from app.geospatial.area import mask_area_km2
-from app.geospatial.grid import AnalysisGrid, align_to_grid, grid_from_profile
+from app.geospatial.grid import (
+    AnalysisGrid,
+    GridMismatchError,
+    align_to_grid,
+    assert_grids_match,
+    grid_from_profile,
+    grids_match,
+)
 from app.geospatial.masks import apply_permanent_water, compute_valid
 from app.geospatial.overlay import intersect_flood_agriculture
 from app.geospatial.raster_io import read_bands, read_single, write_raster
@@ -137,3 +144,49 @@ def test_partial_overlap_area_is_consistent(tmp_path):
     # Exposure covers one quadrant: half of flood area and half of crop area.
     assert exposure_area == pytest.approx(flood_area / 2, rel=1e-6)
     assert exposure_area == pytest.approx(crop_area / 2, rel=1e-6)
+
+
+def test_shifted_raster_same_shape_is_not_treated_as_aligned():
+    """Identical array shapes but different transforms must not count as aligned."""
+    transform, shape = grid_for_bounds(_make_aoi_bounds(), 32646, 10.0)
+    h, w = int(shape[0]), int(shape[1])
+    a = AnalysisGrid("EPSG:32646", transform, w, h, 10.0)
+    shifted = Affine(transform.a, transform.b, transform.c + 500.0,
+                     transform.d, transform.e, transform.f + 500.0)
+    b = AnalysisGrid("EPSG:32646", shifted, w, h, 10.0)
+    assert (a.width, a.height) == (b.width, b.height)
+    assert not grids_match(a, b)
+    with pytest.raises(GridMismatchError):
+        assert_grids_match(a, b, label="shifted")
+    # align_to_grid must reproject (not no-op) when transforms differ.
+    data = np.arange(h * w, dtype=np.float32).reshape(h, w)
+    out = align_to_grid(data, b, a, categorical=True)
+    assert not np.allclose(out, data)
+
+
+def test_pixelwise_ops_require_aligned_grids_end_to_end(tmp_path):
+    """Run the grid checks the pipeline performs before any pixel-wise work."""
+    transform, shape = grid_for_bounds(_make_aoi_bounds(), 32646, 10.0)
+    target = AnalysisGrid("EPSG:32646", transform, int(shape[1]), int(shape[0]), 10.0, nodata=np.nan)
+
+    # SAR in a coarser grid; JRC/WorldCover in a shifted grid with matching shape.
+    coarse = AnalysisGrid("EPSG:32646", Affine(20.0, 0.0, transform.c, 0.0, -20.0, transform.f),
+                          target.width // 2, target.height // 2, 20.0)
+    sar = np.full((coarse.height, coarse.width), -15.0, dtype=np.float32)
+    sar_aligned = align_to_grid(sar, coarse, target, categorical=False)
+    assert sar_aligned.shape == target.shape
+
+    shifted = AnalysisGrid("EPSG:32646",
+                           Affine(10.0, 0.0, transform.c + 10.0, 0.0, -10.0, transform.f),
+                           target.width, target.height, 10.0)
+    wc = np.full((target.height, target.width), 40, dtype=np.float32)
+    wc_aligned = align_to_grid(wc, shifted, target, categorical=True)
+    assert wc_aligned.shape == target.shape
+
+    from app.geospatial.grid import validate_many
+
+    reference = validate_many({
+        "sar": target,
+        "worldcover": AnalysisGrid("EPSG:32646", transform, target.width, target.height, 10.0),
+    })
+    assert reference.shape == target.shape

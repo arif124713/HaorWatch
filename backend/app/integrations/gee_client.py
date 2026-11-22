@@ -13,7 +13,6 @@ JRC_COLLECTION = "JRC/GSW1_4/GlobalSurfaceWater"
 WORLDCOVER_COLLECTION = "ESA/WorldCover/v200"
 
 MAX_TILE_PIXELS = 1200
-METERS_PER_DEGREE = 111320.0
 
 
 class GEEClient:
@@ -115,7 +114,9 @@ class GEEClient:
     ) -> Path:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        tiles = self._tiles(aoi_geojson, scale_m)
+        # Tile in the target projected CRS so tile ground size is constant across
+        # latitude. Region coordinates are expressed in the same CRS passed to GEE.
+        tiles = self._tiles_projected(aoi_geojson, crs, scale_m)
         datasets = []
         tile_files = []
         try:
@@ -144,9 +145,18 @@ class GEEClient:
                     source_crs = src.crs
                     nodata = src.nodata
             else:
-                merged, merged_transform = rio_merge(datasets)
-                source_crs = datasets[0].crs
+                # Guard against stitching tiles with inconsistent grids.
+                crs0 = datasets[0].crs
                 nodata = datasets[0].nodata
+                for dataset in datasets[1:]:
+                    if dataset.crs != crs0:
+                        raise ProviderUnavailableError(
+                            "GEE_MOSAIC_CRS_MISMATCH",
+                            "GEE export tiles have inconsistent CRS; refusing to stitch mismatched rasters.",
+                            503,
+                        )
+                merged, merged_transform = rio_merge(datasets)
+                source_crs = crs0
             if merged.shape[0] == 1:
                 merged = merged[0]
             from app.geospatial.raster_io import write_raster
@@ -177,7 +187,7 @@ class GEEClient:
                 "GEE_EXPORT_FAILED", "Earth Engine export failed; reduce the area or resolution.", 503
             ) from error
 
-    def _tiles(self, aoi_geojson: dict, scale_m: float) -> list[list[float]]:
+    def _aoi_wgs84_bounds(self, aoi_geojson: dict) -> tuple[float, float, float, float]:
         geometry = aoi_geojson.get("geometry", aoi_geojson)
         coordinates = geometry.get("coordinates")
         xs, ys = [], []
@@ -191,17 +201,39 @@ class GEEClient:
                     walk(item)
 
         walk(coordinates)
-        west, east = min(xs), max(xs)
-        south, north = min(ys), max(ys)
-        tile_deg = MAX_TILE_PIXELS * scale_m / METERS_PER_DEGREE
-        tiles = []
-        lat = south
-        while lat < north:
-            lon = west
-            lat_end = min(lat + tile_deg, north)
-            while lon < east:
-                lon_end = min(lon + tile_deg, east)
-                tiles.append([lon, lat, lon_end, lat_end])
-                lon = lon_end
-            lat = lat_end
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def _tiles_projected(self, aoi_geojson: dict, crs: str, scale_m: float) -> list[list[float]]:
+        """Tile the AOI in a projected CRS so every tile covers a constant ground area.
+
+        Degree-based tiling (``MAX_TILE_PIXELS * scale_m / METERS_PER_DEGREE``)
+        produces tiles whose ground width shrinks with latitude, so a fixed
+        pixel budget is not preserved. Tiling in the projected CRS keeps tiles at
+        ``MAX_TILE_PIXELS * scale_m`` metres on each side at any latitude.
+        """
+        west, south, east, north = self._aoi_wgs84_bounds(aoi_geojson)
+        from pyproj import Transformer
+
+        transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+        corners_x, corners_y = [], []
+        for lon, lat in ((west, south), (west, north), (east, south), (east, north)):
+            x, y = transformer.transform(lon, lat)
+            corners_x.append(x)
+            corners_y.append(y)
+        minx, maxx = min(corners_x), max(corners_x)
+        miny, maxy = min(corners_y), max(corners_y)
+
+        tile_m = MAX_TILE_PIXELS * scale_m
+        tiles: list[list[float]] = []
+        y = miny
+        # Guard against pathological inputs producing huge tile counts.
+        max_tiles = 256
+        while y < maxy and len(tiles) < max_tiles:
+            x = minx
+            y_end = min(y + tile_m, maxy)
+            while x < maxx and len(tiles) < max_tiles:
+                x_end = min(x + tile_m, maxx)
+                tiles.append([x, y, x_end, y_end])
+                x = x_end
+            y = y_end
         return tiles

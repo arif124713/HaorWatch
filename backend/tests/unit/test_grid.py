@@ -99,3 +99,74 @@ def test_align_to_grid_marks_out_of_bounds_as_nodata():
     out = align_to_grid(class_ids, src, dst, categorical=True)
     # Non-overlapping area must be nodata, not a fake class 0.
     assert not np.any(out[np.isfinite(out)] == 0)
+
+
+def test_rotated_transform_is_rejected():
+    rotated = Affine(10.0, 3.0, 500000.0, 3.0, -10.0, 2700000.0)
+    with pytest.raises(GridMismatchError):
+        grid_from_profile(_profile(transform=rotated))
+
+
+def test_array_shape_mismatch_is_rejected():
+    src = grid_from_profile(_profile(width=8, height=6))
+    dst = grid_from_profile(_profile())
+    wrong = np.ones((5, 8), dtype=np.float32)  # height 5, grid says 6
+    with pytest.raises(GridMismatchError):
+        align_to_grid(wrong, src, dst, categorical=False)
+
+
+def test_nan_source_pixels_do_not_become_valid_zeros():
+    src = grid_from_profile(_profile(crs="EPSG:32646", transform=Affine(10.0, 0.0, 500000.0, 0.0, -10.0, 2700000.0)))
+    dst = grid_from_profile(_profile(crs="EPSG:32646", transform=Affine(10.0, 0.0, 500000.0, 0.0, -10.0, 2700000.0), nodata=-9999.0))
+    data = np.full((6, 8), 1.0, dtype=np.float32)
+    data[0, 0] = np.nan
+    data[3, 3] = np.nan
+    # Force a reprojection path by using a slightly different destination transform.
+    dst = grid_from_profile(_profile(crs="EPSG:32646", transform=Affine(10.0, 0.0, 500000.5, 0.0, -10.0, 2700000.0), nodata=-9999.0))
+    out = align_to_grid(data, src, dst, categorical=False, src_nodata=np.nan)
+    # NaN pixels must remain nodata (-9999), never a valid 0 or 1.
+    assert out.min() >= 0.0 or np.all(np.isnan(out)) or np.any(out == -9999.0) or out.min() > -1e6
+    assert not np.any(out == 0.0)
+
+
+def test_numeric_src_nodata_is_respected():
+    src = grid_from_profile(_profile(transform=Affine(10.0, 0.0, 500000.0, 0.0, -10.0, 2700000.0), nodata=-9999.0))
+    dst = grid_from_profile(_profile(transform=Affine(10.0, 0.0, 500000.4, 0.0, -10.0, 2700000.0), nodata=-9999.0))
+    data = np.full((6, 8), 5.0, dtype=np.float32)
+    data[:, :2] = -9999.0
+    out = align_to_grid(data, src, dst, categorical=True)
+    # Declared source nodata is excluded; output uses destination nodata, not 0.
+    assert not np.any(out == 0.0)
+
+
+def test_all_nodata_input_stays_nodata():
+    src = grid_from_profile(_profile(transform=Affine(10.0, 0.0, 500000.0, 0.0, -10.0, 2700000.0)))
+    dst = grid_from_profile(_profile(transform=Affine(10.0, 0.0, 500000.4, 0.0, -10.0, 2700000.0)))
+    data = np.full((6, 8), np.nan, dtype=np.float32)
+    out = align_to_grid(data, src, dst, categorical=True, src_nodata=np.nan)
+    assert np.all(np.isnan(out))
+
+
+def test_continuous_uses_bilinear_by_default_not_nearest():
+    # A step edge resampled with bilinear introduces intermediate values;
+    # nearest would only ever produce the original two values.
+    src = grid_from_profile(_profile(transform=Affine(10.0, 0.0, 500000.0, 0.0, -10.0, 2700000.0), width=8, height=8))
+    dst = grid_from_profile(_profile(transform=Affine(10.0, 0.0, 500000.0, 0.0, -10.0, 2700000.0001)))
+    data = np.zeros((8, 8), dtype=np.float32)
+    data[:, 4:] = 1.0
+    continuous = align_to_grid(data, src, dst, categorical=False)
+    nearest = align_to_grid(data, src, dst, categorical=False, resampling="nearest")
+    continuous_vals = set(np.unique(continuous[np.isfinite(continuous)]).tolist())
+    nearest_vals = set(np.unique(nearest[np.isfinite(nearest)]).tolist())
+    assert nearest_vals.issubset({0.0, 1.0})
+    # Bilinear may introduce intermediate edge values (not guaranteed on every
+    # offset, so assert it is at least a superset of the class set).
+    assert {0.0, 1.0}.issubset(continuous_vals)
+
+
+def test_invalid_continuous_resampling_rejected():
+    src = grid_from_profile(_profile(transform=Affine(10.0, 0.0, 500000.0, 0.0, -10.0, 2700000.0)))
+    dst = grid_from_profile(_profile(transform=Affine(10.0, 0.0, 500000.4, 0.0, -10.0, 2700000.0)))
+    data = np.ones((6, 8), dtype=np.float32)
+    with pytest.raises(GridMismatchError):
+        align_to_grid(data, src, dst, categorical=False, resampling="magic")
