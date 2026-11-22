@@ -263,6 +263,12 @@ Include only sources actually used. `status`: used/unavailable/reference_only.
   "caveats": ["এই ফলাফল সম্ভাব্য কৃষিজমির সংস্পর্শ নির্দেশ করে; নিশ্চিত ফসলের ক্ষতি নয়।"]
 }
 ```
+Behavior:
+- Reports are persisted per `(analysis_run_id, language)`; repeated requests return the stored report without regenerating it. Bangla (`bn`) and English (`en`) are stored independently.
+- `created_at` is the time the report was first persisted.
+- Concurrent requests for the same language are race-safe: the unique constraint `uq_report_run_language` guarantees a single stored report; a losing request returns the winner's report.
+- If a report cannot be persisted (unexpected database error, or a conflict with no stored report), the API returns `REPORT_PERSISTENCE_FAILED` (HTTP 500) rather than an unsaved body.
+- Unsupported language returns `422 UNSUPPORTED_LANGUAGE`; unknown analysis returns `404 ANALYSIS_NOT_FOUND`.
 
 ### Trigger analysis (optional/operator only)
 `POST /admin/analyses` with `X-Operator-Key: <secret>`.

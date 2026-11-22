@@ -1,11 +1,16 @@
 import json
+import logging
 from datetime import datetime, timezone
+
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
 from app.core.exceptions import AppError
 from app.integrations.llm_client import LLMClient
 from app.repositories.analysis import AnalysisRepository, utcnow
 from app.schemas.report import ReportResponse
+
+logger = logging.getLogger("haorwatch")
 
 UNAVAILABLE_BN = "পাওয়া যায়নি"
 UNAVAILABLE_EN = "Not available"
@@ -38,7 +43,35 @@ class ReportService:
         if existing is not None:
             return self._to_response(existing, run)
         row = self._generate(run, language)
-        saved = self.repo.save_report(row) or row
+        try:
+            saved = self.repo.save_report(row) or row
+        except IntegrityError:
+            # Another request won the race and inserted the same
+            # (analysis_run_id, language) first. The failed transaction must be
+            # rolled back before the session can be reused, then we return the
+            # report the winning request persisted.
+            self.repo.rollback()
+            winner = self.repo.report_of(run.id, language)
+            if winner is None:
+                logger.exception(
+                    "report persistence conflict for run %s (%s) but no existing report found",
+                    run.id, language,
+                )
+                raise AppError(
+                    "REPORT_PERSISTENCE_FAILED",
+                    "Report could not be persisted; please retry.",
+                    500,
+                )
+            return self._to_response(winner, run)
+        except Exception:
+            # Unexpected persistence failure must not be reported as success.
+            self.repo.rollback()
+            logger.exception("report persistence failed for run %s (%s)", run.id, language)
+            raise AppError(
+                "REPORT_PERSISTENCE_FAILED",
+                "Report could not be persisted; please retry.",
+                500,
+            )
         return self._to_response(saved, run)
 
     def _generate(self, run, language: str):

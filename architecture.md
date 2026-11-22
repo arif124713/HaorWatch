@@ -66,10 +66,14 @@ Frontend does not perform raster processing or ML inference.
 
 ### Background job execution limits
 - Analysis runs execute in a subprocess launched from a FastAPI `BackgroundTasks` callback. This is sufficient for the MVP but has known limitations for long-running production use: the task runs in the API process, there is no queue, no retry, no horizontal scaling, and if the API process is killed mid-run the run can remain `processing` with no automatic recovery. A production deployment should move to a real job runner. This is documented rather than replaced to avoid adding uncontrolled infrastructure.
-- Worker-persisted subprocess output (stdout/stderr) is truncated and passed through a redaction filter that strips likely secrets (API keys, tokens, passwords, operator keys) before it is stored in `processing_config`.
+- Worker-persisted subprocess output (stdout/stderr) is truncated and passed through a redaction filter that strips likely secrets (API keys, tokens, passwords, operator keys, `Authorization: Bearer/Basic`, credential URL query parameters) before it is stored in `processing_config`.
+- The worker records a sanitized subprocess outcome block on the run under `processing_config.subprocess`: `status` (completed/failed/timeout/launch_failed), `exit_code`, `timed_out`, `launched`, `failure_code`, `finished_at`, and bounded `stdout_excerpt`/`stderr_excerpt` (each capped at 2000 characters, redacted then truncated).
+- Only a `queued` run is executed; `processing`/`completed`/`failed` runs are never re-executed. A late worker outcome never overwrites a run the pipeline already finalised (`completed`/`failed`). Database bookkeeping failures are logged but do not raise into the request that launched the worker.
 
 ### Reports
 - Generated reports are persisted per `(analysis_run_id, language)`; a subsequent request for the same language reuses the stored report rather than regenerating it. Failed LLM generation falls back to the deterministic template (labelled `template`), and a report is never stored as `completed` unless a body was produced.
+- The `reports` table has a database-level unique constraint `uq_report_run_language` on `(analysis_run_id, language)` (migration `0002_report_run_language_unique`). This prevents duplicate reports when concurrent requests generate the same report.
+- Report generation is race-safe: on a unique-constraint conflict the service rolls back the failed transaction, re-reads the report persisted by the winning request, and returns it. If no report can be found after the conflict, or persistence fails for another reason, a `REPORT_PERSISTENCE_FAILED` error is raised rather than returning an unsaved report.
 
 ### Permanent-water mask
 - Use JRC Global Surface Water with documented product/version and chosen occurrence/seasonality rule.
@@ -192,6 +196,11 @@ pytest -q
 alembic upgrade head
 python -m scripts.seed_demo
 ```
+
+### Migrations
+- Migrations use Alembic (`backend/alembic/versions/`). Apply with `alembic upgrade head`; roll back one revision with `alembic downgrade -1`.
+- `0002_report_run_language_unique` adds the `reports` unique constraint on `(analysis_run_id, language)`. Before adding the constraint it removes pre-existing duplicate report rows, keeping the earliest per `(analysis_run_id, language)` by `created_at, id` (deterministic; no non-report data is touched). The migration is reversible.
+- Never edit an applied migration; add a new revision. Existing report rows remain readable.
 ### Frontend
 ```bash
 cd frontend

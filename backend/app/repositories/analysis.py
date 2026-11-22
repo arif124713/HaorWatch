@@ -67,6 +67,10 @@ class AnalysisRepository:
         self.db.refresh(report)
         return report
 
+    def rollback(self) -> None:
+        """Roll back the current transaction so the session stays usable."""
+        self.db.rollback()
+
     def dataset_assets_for(self, study_area_id: uuid.UUID) -> list[DatasetAsset]:
         return list(
             self.db.scalars(select(DatasetAsset).where(DatasetAsset.study_area_id == study_area_id))
