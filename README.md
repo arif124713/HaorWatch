@@ -59,4 +59,15 @@ U-Net is the primary custom model for this MVP. Sen1Floods11 is the primary data
 cd backend
 python -m pytest -q
 ```
+Database-backed tests are skipped unless a reachable PostgreSQL is configured:
+```bash
+HAORWATCH_TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:5432/haorwatch python -m pytest -q
+```
+
+### Verification status
+- Unit suite: implemented and passing without a database.
+- Database (PostgreSQL) integration: implemented; requires `HAORWATCH_TEST_DATABASE_URL`. The `reports` unique constraint and concurrent-insert behaviour were verified against PostgreSQL.
+- Migrations: Alembic `0001_initial` → `0002_report_run_language_unique`; single head; upgrade/downgrade validated.
+- Local real-data pipeline: validated on the documented prepared demo bundle with the real checkpoint (stages only; not the live GEE/Sentinel-1 acquisition path).
+- Live GEE/Sentinel-1 acquisition and a full PostGIS-schema end-to-end run: not verified here (require external credentials/data).
 

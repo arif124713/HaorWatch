@@ -97,6 +97,11 @@ Frontend does not perform raster processing or ML inference.
 - **Compute budget:** plan experiments within the available GPU allowance (up to approximately 30 GPU-hours per week if that is the active quota). Prioritize one reproducible baseline U-Net run, validation, and error analysis before hyperparameter sweeps. Save checkpoints regularly and resume interrupted runs.
 - **Evaluation:** report precision, recall, F1, IoU, and confusion matrix on held-out hand-labelled/reference data where valid. Compare U-Net and Otsu on the same held-out pixels and valid-data mask. Report results separately by event/region where sample size permits.
 - **Artifacts and reproducibility:** save model checkpoint, architecture/config, input channel order, normalization statistics, label mapping, dataset references/version/license notes, split manifest, random seed, training logs, best epoch, code commit/hash, and model version.
+- **Model bundle metadata status.** A loadable bundle requires `checkpoint.pt`, `config.json` (with `s1_unit`), and `norm_stats.json` (with `s1_unit`). Current bundles:
+  - `0.1.0`, `0.2.0`, `0.3.0`: declare `s1_unit=dB` in both `config.json` and `norm_stats.json`.
+  - `0.4.0`: a fine-tune of `0.1.0`. Its training used the `0.1.0` `norm_stats.json` (dB). The registered bundle initially shipped only `checkpoint.pt`/`config.json`/`metrics_eval.json` (no unit metadata). During staging validation the unit was established as `dB` from the base artifact and finetune script, and the bundle was completed with `norm_stats.json` (from `0.1.0`) and an explicit `s1_unit: "dB"` plus `s1_unit_provenance` in `config.json`. Model weights were not modified.
+  - The `default.txt` pointer selects the active bundle; verify the selected bundle declares a unit before inference.
+- **Legacy trainer note.** `kaggle/haorwatch_unet_training.py` is a standalone, historical Kaggle trainer that inferred the unit from a median heuristic (`assume_db`). It is not part of the runtime path and is preserved for reproducibility of the existing checkpoints; it is not used to produce or serve bundles and does not affect the runtime SAR-unit contract.
 - **Inference:** return a flood probability raster where practical, plus a thresholded class mask; record the probability threshold and post-processing. Keep U-Net output separate from Otsu baseline.
 - **Fallback rule:** if dataset audit reveals incompatible or insufficient labels, document the blocker and obtain an approved alternative labelled dataset or use the baseline for the demo. Do not claim U-Net was trained or validated unless the run and evidence exist.
 
@@ -201,6 +206,14 @@ python -m scripts.seed_demo
 - Migrations use Alembic (`backend/alembic/versions/`). Apply with `alembic upgrade head`; roll back one revision with `alembic downgrade -1`.
 - `0002_report_run_language_unique` adds the `reports` unique constraint on `(analysis_run_id, language)`. Before adding the constraint it removes pre-existing duplicate report rows, keeping the earliest per `(analysis_run_id, language)` by `created_at, id` (deterministic; no non-report data is touched). The migration is reversible.
 - Never edit an applied migration; add a new revision. Existing report rows remain readable.
+- **Supported database:** PostgreSQL 16 or newer with PostGIS (for the geometry columns created in `0001_initial`). Verified on PostgreSQL 18.0 with PostGIS for migration `0002`.
+
+### Database integration tests
+- Unit tests run without a database. Any test that needs PostgreSQL is skipped unless `HAORWATCH_TEST_DATABASE_URL` points at a reachable database, e.g.:
+  ```bash
+  HAORWATCH_TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:5432/haorwatch pytest -q
+  ```
+- `tests/integration/test_report_uniqueness_db.py` builds a minimal `reports`/`analysis_runs`/`study_areas` schema so it can run against a plain PostgreSQL instance; it verifies the real unique constraint and a real concurrent-insert race.
 ### Frontend
 ```bash
 cd frontend
