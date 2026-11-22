@@ -24,6 +24,8 @@ AOI_PATH = Path(r"data\hakaluki_aoi.geojson")
 OUT = Path(r"data\hakaluki_v04_dataset")
 S2_CLOUD_MAX = 12
 WINDOW_DAYS = 1
+# GEE COPERNICUS/S1_GRD VV/VH are dB backscatter. Declared explicitly; never guessed.
+SAR_UNIT = "dB"
 
 settings = get_settings()
 client = GEEClient(settings.google_earth_engine_project)
@@ -127,7 +129,7 @@ for index, (s1_day, s2_day) in enumerate(pairs):
     bands = []
     converted_any = False
     for band_index in range(2):
-        band, converted = ensure_db(s1_data[band_index])
+        band, converted = ensure_db(s1_data[band_index], SAR_UNIT)
         converted_any = converted_any or converted
         bands.append(band)
     s1_data = np.stack(bands)

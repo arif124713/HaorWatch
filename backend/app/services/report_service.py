@@ -38,7 +38,8 @@ class ReportService:
         if existing is not None:
             return self._to_response(existing, run)
         row = self._generate(run, language)
-        return self._to_response(row, run)
+        saved = self.repo.save_report(row) or row
+        return self._to_response(saved, run)
 
     def _generate(self, run, language: str):
         snapshot = self._snapshot(run)

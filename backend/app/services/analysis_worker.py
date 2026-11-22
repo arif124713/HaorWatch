@@ -11,6 +11,24 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 SUBPROCESS_TIMEOUT_SECONDS = 7200
 DB_CONNECT_TIMEOUT_SECONDS = 5
 
+# Patterns that may appear in subprocess output and must never be persisted.
+_SECRET_PATTERNS = (
+    r"(?i)(api[_-]?key|secret|token|password|passwd|operator[_-]?key|"
+    r"x-operator-key|x-goog-api-key|authorization|client[_-]?secret)\s*[:=]\s*\S+",
+)
+
+
+def _redact(text: str | None, limit: int = 2000) -> str:
+    """Strip likely secrets from subprocess output before it is stored."""
+    if not text:
+        return ""
+    import re
+
+    redacted = text
+    for pattern in _SECRET_PATTERNS:
+        redacted = re.sub(pattern, r"\1=***REDACTED***", redacted)
+    return redacted[-limit:]
+
 
 def _bookkeeping_session_factory():
     """A short-timeout session factory for worker bookkeeping.
@@ -42,7 +60,7 @@ def _mark_run_failed(run_id: str, code: str, message: str, detail: str | None = 
             run = repo.get(_uuid.UUID(run_id))
             if run is None or run.status in ("completed", "failed"):
                 return
-            note = (detail or "")[:2000]
+            note = _redact(detail)
             repo.update_run(
                 run,
                 status="failed",
@@ -120,7 +138,7 @@ def execute_run_subprocess(
         return
 
     if completed.returncode != 0:
-        detail = (completed.stderr or "")[-2000:]
+        detail = _redact(completed.stderr)
         _mark_run_failed(
             run_id,
             "SUBPROCESS_NONZERO_EXIT",

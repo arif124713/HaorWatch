@@ -105,13 +105,17 @@ def predict_probs(model, loader, device):
         with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
             logits = model(images)
         probability = torch.sigmoid(logits.float())[:, 0].cpu().numpy()
+        # One chip id per sample, paired with its own probability/label/valid.
+        # (Extending the whole batch inside the loop duplicated ids and broke the
+        # downstream zip() alignment between predictions and chip identities.)
+        batch_ids = list(ids)
         for index in range(probability.shape[0]):
             probs.append(probability[index])
             label = floods_batch[index, 0].numpy()
             valids_np = valid_batch[index, 0].numpy().astype(bool) & (label != -1)
             valids.append(valids_np)
             floods.append(label.astype(bool))
-            chip_ids.extend(list(ids))
+            chip_ids.append(batch_ids[index])
     return probs, floods, valids, chip_ids
 
 

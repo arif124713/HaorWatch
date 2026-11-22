@@ -13,6 +13,8 @@ from app.ml.inference import load_bundle, predict_tiles
 
 CHIPS_DIR = Path(r"data\prepared\test-chips")
 OUT = Path(r"models\unet\benchmark_20chips.json")
+# Sen1Floods11 hand-labelled S1 chips store VV/VH in dB. Declared explicitly.
+SAR_UNIT = "dB"
 
 
 def score(bundle_dir: str) -> dict:
@@ -35,7 +37,7 @@ def score(bundle_dir: str) -> dict:
             continue
         bands = []
         for band_index in range(image.shape[0]):
-            band, _ = ensure_db(image[band_index])
+            band, _ = ensure_db(image[band_index], SAR_UNIT)
             bands.append(normalize(band, stats["mean"][band_index], stats["std"][band_index]))
         image = np.stack(bands)
         image[:, ~valid] = 0.0

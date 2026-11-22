@@ -66,6 +66,10 @@ Frontend does not perform raster processing or ML inference.
 
 ### Background job execution limits
 - Analysis runs execute in a subprocess launched from a FastAPI `BackgroundTasks` callback. This is sufficient for the MVP but has known limitations for long-running production use: the task runs in the API process, there is no queue, no retry, no horizontal scaling, and if the API process is killed mid-run the run can remain `processing` with no automatic recovery. A production deployment should move to a real job runner. This is documented rather than replaced to avoid adding uncontrolled infrastructure.
+- Worker-persisted subprocess output (stdout/stderr) is truncated and passed through a redaction filter that strips likely secrets (API keys, tokens, passwords, operator keys) before it is stored in `processing_config`.
+
+### Reports
+- Generated reports are persisted per `(analysis_run_id, language)`; a subsequent request for the same language reuses the stored report rather than regenerating it. Failed LLM generation falls back to the deterministic template (labelled `template`), and a report is never stored as `completed` unless a body was produced.
 
 ### Permanent-water mask
 - Use JRC Global Surface Water with documented product/version and chosen occurrence/seasonality rule.
