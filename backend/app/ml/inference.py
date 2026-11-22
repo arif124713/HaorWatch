@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -7,11 +8,26 @@ import torch
 import rasterio
 from app.geospatial.raster_io import write_raster
 from app.ml.features import SarUnitError, band_to_db, normalize, normalize_unit
+from app.ml.model_registry import load_bundle_manifest, verify_or_raise
 from app.ml.unet import UNet
 
 DEFAULT_THRESHOLD = 0.5
 TILE_SIZE = 512
 TILE_STRIDE = 256
+
+# A fallback to another bundle is refused unless explicitly opted in. Set
+# HAORWATCH_ALLOW_MODEL_FALLBACK=1 to permit selecting a verified alternative
+# when the configured default bundle fails verification (documented, deliberate).
+_ALLOW_FALLBACK_ENV = "HAORWATCH_ALLOW_MODEL_FALLBACK"
+
+
+def _bundle_version_of(directory: Path, config: dict) -> str | None:
+    """Determine the registered version of a bundle directory.
+
+    Prefers the directory name (which is how bundles are stored under
+    ``models/unet/<version>``); falls back to the config's ``model_version``.
+    """
+    return directory.name or config.get("model_version")
 
 
 def _resolve_bundle_unit(config: dict, norm_stats: dict, model_dir: Path) -> str:
@@ -39,8 +55,27 @@ def _resolve_bundle_unit(config: dict, norm_stats: dict, model_dir: Path) -> str
     return normalize_unit(config_unit if config_unit is not None else stats_unit)
 
 
-def load_bundle(model_dir: str | Path) -> dict:
+def load_bundle(model_dir: str | Path, verify: bool = True) -> dict:
     directory = Path(model_dir)
+
+    # Fail closed: verify all required files + manifest metadata before loading.
+    if verify:
+        version = directory.name
+        manifest = load_bundle_manifest()
+        known_versions = set(manifest.get("bundles", {}))
+        if version in known_versions:
+            root = directory.parent.parent
+            verify_or_raise(version, root)
+        # A bundle not present in the tracked manifest (e.g. an untracked
+        # experimental directory) is allowed only when it is complete on disk;
+        # required files must still exist.
+        for name in ("config.json", "norm_stats.json", "checkpoint.pt"):
+            if not (directory / name).exists():
+                raise FileNotFoundError(
+                    f"model bundle {directory} is missing required file {name!r}; "
+                    "a valid bundle requires checkpoint.pt, config.json and norm_stats.json."
+                )
+
     config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
     norm_stats = json.loads((directory / "norm_stats.json").read_text(encoding="utf-8"))
     checkpoint = torch.load(directory / "checkpoint.pt", map_location="cpu", weights_only=False)

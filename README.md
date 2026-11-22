@@ -42,6 +42,12 @@ Read in this order: `prd.md`, `architecture.md`, `schema.md`, `api.md`, then `fl
 
 Frontend integration should be possible using the API contract alone. Do not build the frontend yourself.
 
+## Deployment reproducibility (external artifacts)
+
+- **Required for a fresh clone to serve ML results:** `backend/models/unet/<version>/checkpoint.pt`, `config.json`, and `norm_stats.json`, plus `backend/models/unet/default.txt` naming the version. These are gitignored and are **not** present in a fresh clone.
+- **How to obtain them:** from the project's model artifact store, or regenerate from the documented Kaggle notebooks (`backend/kaggle/`). The tracked manifest `backend/app/ml/bundles_manifest.json` records the expected checksums and metadata so a retrieved bundle can be verified before use.
+- **BLOCKED item:** there is **no published artifact-store URL or access instructions** in this repository. Until an artifact source is documented, obtaining the production weights (and therefore reproducing hosted inference) is **BLOCKED**, not merely unverified. No artifact URL is invented here.
+
 ## Required model decision
 U-Net is the primary custom model for this MVP. Sen1Floods11 is the primary dataset candidate and must be audited before training. Random Forest is optional, not a replacement for the U-Net requirement. Work within the available GPU quota (approximately 30 GPU-hours/week if applicable); prioritize a reproducible run, checkpointing, held-out evaluation, and error analysis over broad hyperparameter sweeps.
 
@@ -59,17 +65,20 @@ U-Net is the primary custom model for this MVP. Sen1Floods11 is the primary data
 cd backend
 python -m pytest -q
 ```
-Database-backed tests are skipped unless a reachable PostgreSQL is configured:
+Database-backed tests are skipped unless a reachable PostgreSQL is configured. The target database name must be recognisably a test database (or be explicitly allow-listed); production-like names including `haorwatch` are refused:
 ```bash
-HAORWATCH_TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:5432/haorwatch python -m pytest -q
+HAORWATCH_TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:5432/haorwatch_test \
+HAORWATCH_TEST_DB_ALLOWLIST=haorwatch_test python -m pytest -q
 ```
+`HAORWATCH_TEST_DB_ALLOWLIST` is a comma-separated opt-in list; `HAORWATCH_ALLOW_NON_TEST_DB=1` is a deliberate override for non-test names. Unknown/ambiguous targets are refused by default, and credentials are never logged.
 
 ### Verification status
 - Unit suite: implemented and passing without a database.
-- Database integration: tests run against a real PostgreSQL and isolate their own schema (never drop public tables); require `HAORWATCH_TEST_DATABASE_URL`.
+- Database integration: isolated-schema tests (`test_report_uniqueness_db.py`, `test_report_service_concurrency_db.py`) create a unique schema, pin `search_path`, create the real ORM tables inside it, and drop only that schema; they never read or write shared `public` application rows. The ORM concurrency test is synchronised at the repository boundary (both callers complete the initial lookup before either inserts) and asserts exactly one persisted report with identical returned IDs. **Not executed in this environment** — no reachable PostgreSQL (no local server, no Docker); skipped with a recorded reason.
 - Migrations: Alembic `0001_initial` → `0002_report_run_language_unique`; single head. The **full chain including PostGIS** (extension, geometry columns, GiST indexes) was executed and verified on PostgreSQL 18.0 + PostGIS 3.6.2, including downgrade/re-upgrade.
-- Report `ReportService` concurrency over the full ORM schema: verified on the migrated PostGIS database.
-- Model bundles: weights are not in Git; the tracked manifest `app/ml/model_registry.py::bundles_manifest.json` records filenames and SHA-256 checksums; every loadable bundle declares `s1_unit=dB`.
-- Local real-data pipeline: validated on the documented prepared bundles with the real checkpoint (stages only; not the live GEE/Sentinel-1 acquisition path).
+- Model bundles: weights are not in Git; the tracked manifest `app/ml/bundles_manifest.json` records filenames and SHA-256 checksums of `checkpoint.pt`, `config.json`, and `norm_stats.json`, plus `model_version`, `s1_unit`, band order, and probability threshold. `verify_bundle`/`load_bundle`/`resolve_model_dir` verify this metadata **before loading or selecting** a bundle and fail closed on a corrupt configured default. Every loadable bundle declares `s1_unit=dB`.
+- Model artifact retrieval: weights are **not** in Git and are not in Git LFS. A fresh clone has **no** model artifacts; obtain them from the project model artifact store or regenerate them from the documented Kaggle notebooks and place them at `backend/models/unet/<version>/`. The tests exercise bundle verification on synthetic bundles so they run without real weights.
+- Local real-data pipeline: validated on the documented prepared bundles with the real checkpoint (stages only; not the live GEE/Sentinel-1 acquisition path). Note the DB-free staged path is distinct from PostGIS-backed end-to-end execution.
 - Live GEE/Sentinel-1 acquisition: not verified here (requires external credentials/data).
+- Validation category: Hakaluki operator-tile results are **positive-only** positive-class agreement, not full-binary accuracy; Sentinel-2 MNDWI labels are **proxy** labels, not ground truth.
 

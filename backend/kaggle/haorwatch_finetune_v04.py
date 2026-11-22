@@ -278,9 +278,21 @@ def classification_metrics(counts):
 
 @torch.no_grad()
 def predict_full(model, pair_dir):
-    with rasterio.open(Path(pair_dir) / "s1_grid.tif") as src:
+    pair_dir = Path(pair_dir)
+    with rasterio.open(pair_dir / "s1_grid.tif") as src:
         image = src.read().astype(np.float32)
     valid = np.isfinite(image).all(axis=0)
+    # Consistency with training: apply the same validity mask (valid SAR ∧ valid
+    # Sentinel-2 reference) that PairDataset uses, so evaluation never scores
+    # pixels that training treated as invalid/ignored.
+    valid_mask_path = pair_dir / "valid_mask.tif"
+    if valid_mask_path.exists():
+        with rasterio.open(valid_mask_path) as src:
+            valid = valid & (src.read(1) > 0.5)
+    label_path = pair_dir / "pseudo_label.tif"
+    if label_path.exists():
+        with rasterio.open(label_path) as src:
+            valid = valid & (src.read(1) != -1)
     for band_index in range(2):
         band = image[band_index]
         band = (band - norm_stats["mean"][band_index]) / norm_stats["std"][band_index]

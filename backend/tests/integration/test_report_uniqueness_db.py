@@ -10,8 +10,6 @@ connections set ``search_path`` to the isolated schema. It refuses to run
 against a database that looks like production unless explicitly overridden.
 """
 
-import os
-import socket
 import threading
 import uuid
 
@@ -19,48 +17,14 @@ import pytest
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import IntegrityError
 
-TEST_URL = os.environ.get("HAORWATCH_TEST_DATABASE_URL")
-# Explicit override required if the target database name looks like production.
-ALLOW_NON_TEST_DB = os.environ.get("HAORWATCH_ALLOW_NON_TEST_DB") == "1"
+from tests.integration._test_db import resolve_target
 
-# Substrings that indicate a database is (or may be) a real application DB.
-_PRODUCTION_MARKERS = ("prod", "production", "live", "staging", "haorwatch")
-_SAFE_MARKERS = ("test", "ci", "tmp", "temp", "scratch", "sandbox")
-
-
-def _database_name(url: str) -> str:
-    return url.rsplit("/", 1)[-1].split("?", 1)[0]
-
-
-def _host_port(url: str) -> tuple[str, int]:
-    host = url.split("@")[-1].split("/")[0]
-    hostname, _, port = host.partition(":")
-    return (hostname or "localhost"), int(port or 5432)
-
-
-def _reachable(url: str) -> bool:
-    try:
-        hostname, port = _host_port(url)
-        s = socket.create_connection((hostname, port), timeout=2)
-        s.close()
-        return True
-    except Exception:
-        return False
-
-
-def _looks_like_production(url: str) -> bool:
-    name = _database_name(url).lower()
-    if any(marker in name for marker in _SAFE_MARKERS):
-        return False
-    return any(marker in name for marker in _PRODUCTION_MARKERS)
-
-
-_DB_AVAILABLE = bool(TEST_URL) and _reachable(TEST_URL) if TEST_URL else False
-_DB_REFUSED = _DB_AVAILABLE and _looks_like_production(TEST_URL) and not ALLOW_NON_TEST_DB
+_TARGET = resolve_target()
+TEST_URL = _TARGET.url
 
 pytestmark = pytest.mark.skipif(
-    not _DB_AVAILABLE,
-    reason="No reachable test database configured (set HAORWATCH_TEST_DATABASE_URL).",
+    _TARGET.skip_reason is not None,
+    reason=_TARGET.skip_reason or "",
 )
 
 
@@ -74,11 +38,6 @@ def _ident(name: str) -> str:
 @pytest.fixture(scope="module")
 def isolated_schema():
     """Create and drop a uniquely-named schema; never touch public tables."""
-    if _DB_REFUSED:
-        pytest.skip(
-            "HAORWATCH_TEST_DATABASE_URL names a database that looks like production; "
-            "set HAORWATCH_ALLOW_NON_TEST_DB=1 to override explicitly."
-        )
     schema = f"haorwatch_test_{uuid.uuid4().hex[:12]}"
     quoted = _ident(schema)
     admin = create_engine(TEST_URL)

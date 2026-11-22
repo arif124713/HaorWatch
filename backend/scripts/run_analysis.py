@@ -324,9 +324,9 @@ def _execute(db, repo, area, run, run_dir: Path, start, end, model_dir, orbit, p
     baseline_mask, baseline_threshold = otsu_flood_mask(band_to_db(vh, s1_unit), valid, water_is_low=True)
     baseline_area = mask_area_km2(baseline_mask, s1_transform)
 
-    model_dir = model_dir or (
-        str(resolve_model_dir(settings.model_root)) if resolve_model_dir(settings.model_root) else None
-    )
+    if model_dir is None:
+        resolved = resolve_model_dir(settings.model_root)
+        model_dir = str(resolved) if resolved else None
     ml_mask = None
     probability_threshold = None
     if model_dir:
