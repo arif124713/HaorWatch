@@ -7,13 +7,27 @@ generated before the validity-mask fix: such a stale pair may lack
 grid/nodata/self-consistency metadata, and must be rebuilt rather than silently
 trusted.
 
-The functions here are dependency-light (JSON + a small amount of rasterio) so
-they can be unit-tested with synthetic fixtures.
+Builder semantics encoded here (do not invent new meanings):
+
+* ``s1_valid_mask.tif`` — valid SAR observations: AOI ∧ finite/sentinel-free SAR
+  (the builder's ``valid`` mask). ``s1_grid.tif`` is the SAR grid with invalid
+  pixels set to non-finite (NaN) and nodded.
+* ``valid_mask.tif`` — valid supervision region: AOI ∧ valid SAR ∧ valid
+  Sentinel-2 reference (the builder's ``pair_valid``). This is a subset of
+  ``s1_valid_mask.tif``. The manifest ``valid_px`` field is defined as the count
+  of pixels where ``valid_mask.tif`` is 1.
+* ``pseudo_label.tif`` — the label with the configured ignore value wherever
+  ``valid_mask.tif`` is 0, and only ``{0, 1}`` where ``valid_mask.tif`` is 1.
+
+The functions here are dependency-light (JSON + rasterio) so they can be
+unit-tested with synthetic fixtures. Large rasters are validated with bounded
+windowed reads; no lossy decimation is used as proof of validity.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,30 +37,36 @@ import numpy as np
 # generation semantics change so stale pairs are detected and rebuilt.
 BUILDER_VERSION = "0.4.1-validity"
 
-# Artifacts a reusable pair MUST contain. All four are mandatory: the reuse
-# contract checks the full required set (there is no "critical subset" that can
-# be satisfied while a required artifact is absent).
+# Artifacts a reusable pair MUST contain. All four are mandatory.
 REQUIRED_PAIR_ARTIFACTS = (
     "s1_grid.tif",
     "pseudo_label.tif",
     "valid_mask.tif",
     "s1_valid_mask.tif",
 )
-# Backwards-compatible alias. The earlier design distinguished a "critical"
-# subset from the full set, which allowed a pair missing ``s1_valid_mask.tif`` to
-# be accepted. The alias now equals the full required set so no caller can
-# accidentally validate only a subset.
+# Backwards-compatible alias; equals the full required set by design.
 CRITICAL_PAIR_ARTIFACTS = REQUIRED_PAIR_ARTIFACTS
 
-# Binary masks whose on-disk values must be exactly {0, 1}.
-_BINARY_MASK_ARTIFACTS = ("valid_mask.tif", "s1_valid_mask.tif")
-# Rasters that must preserve the configured ignore sentinel for invalid pixels.
-_LABEL_ARTIFACT = "pseudo_label.tif"
-# SAR grid whose invalid pixels must stay non-finite / sentinel.
+# Artifact roles.
 _SAR_GRID_ARTIFACT = "s1_grid.tif"
+_LABEL_ARTIFACT = "pseudo_label.tif"
+_VALID_MASK_ARTIFACT = "valid_mask.tif"       # supervision validity (defines valid_px)
+_S1_VALID_MASK_ARTIFACT = "s1_valid_mask.tif"  # valid SAR observations
+_BINARY_MASK_ARTIFACTS = (_VALID_MASK_ARTIFACT, _S1_VALID_MASK_ARTIFACT)
+
+# Expected single-band count for the artefacts above (s1_grid has 2 bands).
+_EXPECTED_BAND_COUNT = {
+    _SAR_GRID_ARTIFACT: 2,
+    _LABEL_ARTIFACT: 1,
+    _VALID_MASK_ARTIFACT: 1,
+    _S1_VALID_MASK_ARTIFACT: 1,
+}
 
 _BINARY_TOL = 1e-6
 _RES_TOL = 1e-3
+# Bounded windowed-read size (pixels per block). Keeps memory constant
+# regardless of raster size while still validating every pixel.
+_WINDOW_PIXELS = 1_048_576
 
 
 @dataclass
@@ -55,42 +75,70 @@ class CacheDecision:
     stale_reasons: list[str] = field(default_factory=list)
 
 
-def _read_raster_meta(path: Path) -> dict | None:
-    """Read CRS/transform/shape/resolution/nodata. Return None if unreadable."""
+class _RasterUnreadable(Exception):
+    """Internal marker: a raster could not be opened/read (a stale reason)."""
+
+
+def _open_raster(path: Path):
+    """Open a raster, raising ``_RasterUnreadable`` on any read/open failure."""
+    import rasterio
+
     try:
-        import rasterio
-    except ImportError:
+        return rasterio.open(path)
+    except (rasterio.errors.RasterioIOError, OSError, ValueError) as exc:
+        raise _RasterUnreadable(f"{path.name}: {type(exc).__name__}") from exc
+
+
+def _read_raster_meta(path: Path) -> dict | None:
+    """Read CRS/transform/shape/resolution/band-count/nodata. None if unreadable."""
+    try:
+        src = _open_raster(path)
+    except _RasterUnreadable:
         return None
     try:
-        with rasterio.open(path) as src:
+        with src:
+            crs = src.crs
+            transform = src.transform
+            # Resolution from the transform's pixel size; always two elements.
+            res = (abs(float(transform.a)), abs(float(transform.e)))
             return {
-                "crs": src.crs.to_string() if src.crs else None,
-                "transform": [float(v) for v in list(src.transform)[:6]],
+                "crs": crs.to_string() if crs else None,
+                "transform": [float(v) for v in list(transform)[:6]],
                 "shape": [int(src.height), int(src.width)],
-                "res": [abs(float(src.transform.a)), abs(float(src.transform.e))],
+                "res": [float(res[0]), float(res[1])],
                 "nodata": src.nodata,
                 "count": int(src.count),
             }
     except (rasterio.errors.RasterioIOError, OSError, ValueError):
-        # A corrupted/unreadable TIFF is a validation failure, not a crash.
         return None
 
 
-def _read_raster_values(path: Path, max_pixels: int = 4_000_000):
-    """Read band 1 as float64 for value-level checks. None if unreadable/too big."""
-    try:
-        import rasterio
-    except ImportError:
-        return None
-    try:
-        with rasterio.open(path) as src:
-            if src.width * src.height > max_pixels:
-                # Too large to fully read: sample a decimated window instead.
-                indices = src.read(1, out_shape=(min(src.height, 512), min(src.width, 512)))
-                return indices.astype("float64")
-            return src.read(1).astype("float64")
-    except (rasterio.errors.RasterioIOError, OSError, ValueError):
-        return None
+def _iter_windows(path: Path):
+    """Yield (window, np.ndarray band-1 float64) blocks covering the whole raster.
+
+    Reads every pixel exactly once with bounded memory. Raises
+    ``_RasterUnreadable`` if the raster cannot be opened or any block read fails.
+    """
+    import rasterio
+    from rasterio.windows import Window
+
+    src = _open_raster(path)
+    with src:
+        width, height = src.width, src.height
+        if width <= 0 or height <= 0:
+            raise _RasterUnreadable(f"{path.name}: non-positive dimensions")
+        block = max(1, int(math.isqrt(_WINDOW_PIXELS)))
+        try:
+            # Prefer the raster's own block layout when available.
+            for row_off in range(0, height, block):
+                rows = min(block, height - row_off)
+                for col_off in range(0, width, block):
+                    cols = min(block, width - col_off)
+                    window = Window(col_off, row_off, cols, rows)
+                    values = src.read(1, window=window).astype("float64")
+                    yield window, values
+        except (rasterio.errors.RasterioIOError, OSError, ValueError) as exc:
+            raise _RasterUnreadable(f"{path.name}: {type(exc).__name__}") from exc
 
 
 def _close(a, b, tol: float = 1e-6) -> bool:
@@ -100,102 +148,244 @@ def _close(a, b, tol: float = 1e-6) -> bool:
         return False
 
 
-def _transform_close(got, expected, tol: float = 1e-4) -> bool:
+def _crs_equal(got, expected, tol: float = 1e-9) -> bool:
+    """Semantic CRS comparison using pyproj; falls back to string equality."""
     if got is None or expected is None:
         return False
-    return len(got) == len(expected) and all(_close(a, b, tol=tol) for a, b in zip(got, expected))
+    try:
+        from pyproj import CRS
+
+        return CRS.from_user_input(got).equals(CRS.from_user_input(expected), ignore_axis_order=True)
+    except Exception:  # noqa: BLE001 - fall back to normalized string compare
+        return str(got).strip().upper() == str(expected).strip().upper()
+
+
+def _transform_close(got, expected, tol: float = 1e-4) -> bool:
+    if got is None or expected is None or len(got) != 6 or len(expected) != 6:
+        return False
+    return all(_close(a, b, tol=tol) for a, b in zip(got, expected))
+
+
+def _res_close(got, expected, tol: float = _RES_TOL) -> bool:
+    if not isinstance(got, (list, tuple)) or not isinstance(expected, (list, tuple)):
+        return False
+    if len(got) != 2 or len(expected) != 2:
+        return False
+    return all(_close(a, b, tol=tol) for a, b in zip(got, expected))
+
+
+def _validate_expected_grid(expected_grid: dict, reasons: list[str]) -> bool:
+    """Validate that the expected grid carries the fields needed for reuse.
+
+    Returns True when the expected grid is usable. Missing/malformed expected
+    fields are a cache failure (we cannot prove safety), not a silent skip.
+    """
+    ok = True
+    crs = expected_grid.get("crs")
+    if not crs:
+        reasons.append("expected grid is missing 'crs'")
+        ok = False
+    transform = expected_grid.get("transform")
+    if not isinstance(transform, (list, tuple)) or len(transform) != 6:
+        reasons.append("expected grid transform must be a 6-element sequence")
+        ok = False
+    shape = expected_grid.get("shape")
+    if not isinstance(shape, (list, tuple)) or len(shape) != 2:
+        reasons.append("expected grid shape must be a 2-element sequence")
+        ok = False
+    res = expected_grid.get("res")
+    if res is not None and (not isinstance(res, (list, tuple)) or len(res) != 2):
+        reasons.append("expected grid resolution must be a 2-element sequence")
+        ok = False
+    return ok
 
 
 def _validate_raster_against_grid(name: str, meta: dict, expected_grid: dict, reasons: list[str]) -> None:
-    """Check a raster's CRS/transform/shape/resolution against the expected grid."""
+    """Check a raster's CRS/transform/shape/resolution/band-count vs the grid."""
     exp_crs = expected_grid.get("crs")
+    if exp_crs:
+        if not meta.get("crs"):
+            reasons.append(f"{name} has no CRS but the expected grid is {exp_crs!r}")
+        elif not _crs_equal(meta["crs"], exp_crs):
+            reasons.append(f"{name} crs {meta['crs']!r} != {exp_crs!r}")
+
     exp_transform = expected_grid.get("transform")
-    exp_shape = expected_grid.get("shape")
-    if exp_crs is not None and meta.get("crs") and meta["crs"] != exp_crs:
-        reasons.append(f"{name} crs {meta['crs']!r} != {exp_crs!r}")
     if exp_transform is not None and not _transform_close(meta.get("transform"), exp_transform):
-        reasons.append(f"{name} transform {meta.get('transform')!r} != {exp_transform!r}")
+        reasons.append(f"{name} transform {meta.get('transform')!r} != {list(exp_transform)!r}")
+
+    exp_shape = expected_grid.get("shape")
     if exp_shape is not None and meta.get("shape") != list(exp_shape):
         reasons.append(f"{name} shape {meta['shape']!r} != {list(exp_shape)!r}")
-    # Resolution is derived from the transform; validate it when both sides have it.
+
     exp_res = expected_grid.get("res")
-    if exp_res is not None and meta.get("res") is not None:
-        if not all(_close(a, b, tol=_RES_TOL) for a, b in zip(meta["res"], exp_res)):
-            reasons.append(f"{name} resolution {meta['res']!r} != {list(exp_res)!r}")
+    if exp_res is not None:
+        if not _res_close(meta.get("res"), exp_res):
+            reasons.append(f"{name} resolution {meta.get('res')!r} != {list(exp_res)!r}")
+
+    expected_count = _EXPECTED_BAND_COUNT.get(name)
+    if expected_count is not None and meta.get("count") != expected_count:
+        reasons.append(f"{name} has {meta.get('count')} bands; expected {expected_count}")
 
 
-def _validate_nodata_semantics(
+def _mask_is_binary(path: Path, *, reasons: list[str]) -> bool:
+    """Windowed scan: return True iff band 1 contains only {0, 1} (ignoring nodata)."""
+    meta = _read_raster_meta(path)
+    nodata = meta.get("nodata") if meta else None
+    try:
+        for _window, values in _iter_windows(path):
+            finite = values[np.isfinite(values)]
+            if nodata is not None and math.isfinite(float(nodata)):
+                finite = finite[~np.isclose(finite, float(nodata), atol=_BINARY_TOL)]
+            if finite.size == 0:
+                continue
+            bad = finite[~((np.abs(finite) <= _BINARY_TOL) | (np.abs(finite - 1.0) <= _BINARY_TOL))]
+            if bad.size:
+                reasons.append(f"{path.name} has non-binary mask values (e.g. {float(bad[0])!r})")
+                return False
+    except _RasterUnreadable as exc:
+        reasons.append(f"{path.name} unreadable: {exc}")
+        return False
+    return True
+
+
+def _iter_window_arrays(paths: list[Path]):
+    """Yield aligned (window, {name: array}) blocks for several same-grid rasters."""
+    import rasterio
+
+    handles = {}
+    try:
+        for path in paths:
+            handles[path.name] = _open_raster(path)
+        ref = handles[paths[0].name]
+        width, height = ref.width, ref.height
+        block = max(1, int(math.isqrt(_WINDOW_PIXELS)))
+        from rasterio.windows import Window
+
+        for row_off in range(0, height, block):
+            rows = min(block, height - row_off)
+            for col_off in range(0, width, block):
+                cols = min(block, width - col_off)
+                window = Window(col_off, row_off, cols, rows)
+                block_arrays = {}
+                for path in paths:
+                    block_arrays[path.name] = handles[path.name].read(1, window=window).astype("float64")
+                yield window, block_arrays
+    except _RasterUnreadable:
+        raise
+    except (rasterio.errors.RasterioIOError, OSError, ValueError) as exc:
+        raise _RasterUnreadable(str(exc)) from exc
+    finally:
+        for handle in handles.values():
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _validate_pixel_semantics(
     pair_dir: Path,
     *,
     expected_ignore_value: float,
-    expected_grid: dict,
     reasons: list[str],
-) -> None:
-    """Validate nodata/binary semantics of the four artifacts.
+) -> tuple[int, int]:
+    """Windowed pixel-level consistency checks across label/SAR/masks.
 
-    * Binary masks must contain only {0, 1} (plus their declared nodata).
-    * The pseudo-label must use the configured ignore value for invalid pixels
-      and must not turn them into silent non-water zeros.
-    * The SAR grid must keep invalid pixels non-finite or at its declared
-      nodata sentinel.
+    Returns ``(valid_px_count, invalid_px_count)`` derived from ``valid_mask.tif``.
+    All checks scan every pixel with bounded memory.
     """
-    # Binary validity masks: values must be binary.
-    for name in _BINARY_MASK_ARTIFACTS:
-        path = pair_dir / name
-        values = _read_raster_values(path)
-        meta = _read_raster_meta(path)
-        if values is None or meta is None:
-            continue  # unreadable already reported elsewhere
-        nodata = meta.get("nodata")
-        finite = values[~_is_nodata(values, nodata)]
-        unique = set()
-        for value in finite.ravel():
-            unique.add(round(float(value), 6))
-            if len(unique) > 8:
-                break
-        bad = [v for v in unique if not (_close(v, 0.0, _BINARY_TOL) or _close(v, 1.0, _BINARY_TOL))]
-        if bad:
-            reasons.append(f"{name} has non-binary mask values: {sorted(bad)[:5]}")
+    s1_grid = pair_dir / _SAR_GRID_ARTIFACT
+    label = pair_dir / _LABEL_ARTIFACT
+    valid_mask = pair_dir / _VALID_MASK_ARTIFACT
+    s1_valid_mask = pair_dir / _S1_VALID_MASK_ARTIFACT
 
-    # Pseudo-label: invalid pixels must be the ignore value, not a valid class.
-    label_meta = _read_raster_meta(pair_dir / _LABEL_ARTIFACT)
-    label_values = _read_raster_values(pair_dir / _LABEL_ARTIFACT)
-    if label_meta is not None and label_values is not None:
-        declared = label_meta.get("nodata")
-        if declared is None or not _close(declared, expected_ignore_value):
-            reasons.append(
-                f"{_LABEL_ARTIFACT} nodata {declared!r} != expected ignore value {expected_ignore_value!r}"
-            )
-        # Values must lie in {ignore, 0, 1}; anything else is an uninterpretable label.
-        finite = label_values[np.isfinite(label_values)]
-        allowed = {round(float(expected_ignore_value), 6), 0.0, 1.0}
-        for value in finite.ravel():
-            if round(float(value), 6) not in allowed:
-                reasons.append(f"{_LABEL_ARTIFACT} contains an unexpected label value {value!r}")
-                break
+    # Binary mask value checks first (cheap, and required for the cross-checks).
+    bin_ok = True
+    for mask_name in _BINARY_MASK_ARTIFACTS:
+        bin_ok &= _mask_is_binary(pair_dir / mask_name, reasons=reasons)
+    if not bin_ok:
+        return 0, 0
 
-    # SAR grid: invalid pixels must be preserved (non-finite) rather than a
-    # finite value that could later be mistaken for a real observation.
-    sar_meta = _read_raster_meta(pair_dir / _SAR_GRID_ARTIFACT)
-    sar_values = _read_raster_values(pair_dir / _SAR_GRID_ARTIFACT)
-    if sar_meta is not None and sar_values is not None:
-        nodata = sar_meta.get("nodata")
-        if nodata is None:
-            reasons.append(f"{_SAR_GRID_ARTIFACT} does not declare nodata; invalid SAR cannot be preserved")
-        elif np.isfinite(nodata):
-            # When nodata is finite, declared nodata pixels must actually take
-            # that value (not a plausible backscatter magnitude).
-            declared_count = int((np.abs(sar_values - float(nodata)) <= _BINARY_TOL).sum())
-            if declared_count == 0 and (sar_values.size and not bool(np.isnan(sar_values).any())):
+    # Manifests for nodata conventions.
+    s1_nodata = (_read_raster_meta(s1_grid) or {}).get("nodata")
+    label_nodata = (_read_raster_meta(label) or {}).get("nodata")
+
+    if label_nodata is None or not _close(label_nodata, expected_ignore_value):
+        reasons.append(
+            f"{_LABEL_ARTIFACT} nodata {label_nodata!r} != expected ignore value {expected_ignore_value!r}"
+        )
+    if s1_nodata is None:
+        reasons.append(f"{_SAR_GRID_ARTIFACT} does not declare nodata; invalid SAR cannot be preserved")
+
+    valid_px = 0
+    invalid_px = 0
+    supervision_subset_ok = True
+    label_ignore_ok = True
+    label_class_ok = True
+    sar_invalid_ok = True
+    sar_valid_finite_ok = True
+
+    try:
+        for _window, arrays in _iter_window_arrays([valid_mask, s1_valid_mask, label, s1_grid]):
+            vm = arrays[valid_mask.name] > 0.5
+            s1m = arrays[s1_valid_mask.name] > 0.5
+            lab = arrays[label.name]
+            sar = arrays[s1_grid.name]
+
+            valid_px += int(vm.sum())
+            invalid_px += int((~vm).sum())
+
+            # valid_mask (supervision) must be a subset of s1_valid_mask (SAR).
+            if supervision_subset_ok and np.any(vm & ~s1m):
                 reasons.append(
-                    f"{_SAR_GRID_ARTIFACT} declares a finite nodata {nodata!r} but carries none"
+                    f"{_VALID_MASK_ARTIFACT} marks pixels valid that {_S1_VALID_MASK_ARTIFACT} marks invalid"
                 )
+                supervision_subset_ok = False
 
+            # Label ignore consistency: invalid supervision => ignore value.
+            if label_ignore_ok:
+                invalid_supervision = ~vm
+                bad_ignore = invalid_supervision & ~np.isclose(lab, float(expected_ignore_value), atol=_BINARY_TOL)
+                if np.any(bad_ignore):
+                    reasons.append(
+                        f"{_LABEL_ARTIFACT} does not carry the ignore value where {_VALID_MASK_ARTIFACT} is 0"
+                    )
+                    label_ignore_ok = False
 
-def _is_nodata(values, nodata):
-    if nodata is None:
-        return ~np.isfinite(values)
-    return (~np.isfinite(values)) | (np.abs(values - float(nodata)) <= _BINARY_TOL)
+            # Label class consistency: valid supervision => only {0, 1}.
+            if label_class_ok:
+                valid_supervision = vm
+                lv = lab[valid_supervision]
+                if lv.size:
+                    bad = lv[~((np.abs(lv) <= _BINARY_TOL) | (np.abs(lv - 1.0) <= _BINARY_TOL))]
+                    if bad.size:
+                        reasons.append(
+                            f"{_LABEL_ARTIFACT} contains a class other than 0/1 where supervision is valid: {float(bad[0])!r}"
+                        )
+                        label_class_ok = False
+
+            # SAR invalid pixels must be represented non-finite (builder convention).
+            if sar_invalid_ok:
+                invalid_sar = ~s1m
+                if np.any(invalid_sar & np.isfinite(sar)):
+                    reasons.append(
+                        f"{_SAR_GRID_ARTIFACT} has finite values where {_S1_VALID_MASK_ARTIFACT} is 0 "
+                        "(invalid SAR must be non-finite)"
+                    )
+                    sar_invalid_ok = False
+
+            # SAR valid pixels must be finite (never silently nodata/non-finite).
+            if sar_valid_finite_ok:
+                valid_sar = s1m
+                if np.any(valid_sar & ~np.isfinite(sar)):
+                    reasons.append(
+                        f"{_SAR_GRID_ARTIFACT} has non-finite values where {_S1_VALID_MASK_ARTIFACT} is 1"
+                    )
+                    sar_valid_finite_ok = False
+    except _RasterUnreadable as exc:
+        reasons.append(f"pixel-semantics scan failed: {exc}")
+        return 0, 0
+
+    return valid_px, invalid_px
 
 
 def evaluate_pair_cache(
@@ -211,27 +401,29 @@ def evaluate_pair_cache(
 ) -> CacheDecision:
     """Decide whether a cached pair may be reused.
 
-    ``expected_grid`` must contain ``crs``, ``transform`` (6-tuple), ``shape``
-    (h, w) and may contain ``res`` (x_res, y_res). ``record`` is the per-pair
-    metadata entry previously written to the dataset manifest (or ``None``).
-
     A pair is reusable only when every required artifact is present and readable,
-    each raster matches the expected grid (CRS/transform/shape/resolution), the
-    nodata/binary semantics hold, and the manifest record is present and
-    consistent with the expected SAR unit, ignore value, builder version, source
-    dates, grid, and valid-pixel count.
+    each raster matches the expected grid (CRS/transform/shape/resolution/band
+    count), the pixel-level label/SAR/mask semantics hold, and the manifest
+    record is present and consistent (including ``valid_px`` matching
+    ``valid_mask.tif``).
     """
     pair_dir = Path(pair_dir)
     reasons: list[str] = []
+
+    # 0. The expected grid must be usable for safe reuse.
+    grid_ok = _validate_expected_grid(expected_grid, reasons)
 
     # 1. Every required artifact must be present.
     missing = [name for name in REQUIRED_PAIR_ARTIFACTS if not (pair_dir / name).exists()]
     if missing:
         reasons.append(f"missing required artifacts: {missing}")
 
-    # 2. Manifest record must exist; without it the pair cannot be trusted.
+    # 2. Manifest record must exist and be a well-formed object.
     if record is None:
         reasons.append("no per-pair manifest record")
+        return CacheDecision(reusable=False, stale_reasons=reasons)
+    if not isinstance(record, dict):
+        reasons.append(f"manifest record is not an object: {type(record).__name__}")
         return CacheDecision(reusable=False, stale_reasons=reasons)
 
     # 3. Metadata contract: version, unit, ignore value, dates.
@@ -254,16 +446,32 @@ def evaluate_pair_cache(
         reasons.append(f"s2_day {record.get('s2_day')!r} != {expected_s2_day!r}")
 
     # 4. Recorded grid must match the expected grid.
-    grid = record.get("grid") or {}
-    if expected_grid.get("crs") is not None and grid.get("crs") != expected_grid.get("crs"):
-        reasons.append(f"recorded grid crs {grid.get('crs')!r} != {expected_grid.get('crs')!r}")
-    if expected_grid.get("shape") is not None and list(grid.get("shape") or []) != list(
-        expected_grid.get("shape")
-    ):
-        reasons.append(f"recorded grid shape {grid.get('shape')!r} != {expected_grid.get('shape')!r}")
-    exp_transform = expected_grid.get("transform")
-    if exp_transform is not None and not _transform_close(grid.get("transform"), exp_transform):
-        reasons.append(f"recorded grid transform {grid.get('transform')!r} != {exp_transform!r}")
+    recorded_grid = record.get("grid")
+    if not isinstance(recorded_grid, dict):
+        reasons.append(f"recorded grid is not an object: {recorded_grid!r}")
+    elif grid_ok:
+        if expected_grid.get("crs") and not _crs_equal(recorded_grid.get("crs"), expected_grid.get("crs")):
+            reasons.append(
+                f"recorded grid crs {recorded_grid.get('crs')!r} != {expected_grid.get('crs')!r}"
+            )
+        if expected_grid.get("shape") is not None and list(recorded_grid.get("shape") or []) != list(
+            expected_grid.get("shape")
+        ):
+            reasons.append(
+                f"recorded grid shape {recorded_grid.get('shape')!r} != {expected_grid.get('shape')!r}"
+            )
+        exp_transform = expected_grid.get("transform")
+        if exp_transform is not None and not _transform_close(
+            recorded_grid.get("transform"), exp_transform
+        ):
+            reasons.append(
+                f"recorded grid transform {recorded_grid.get('transform')!r} != {list(exp_transform)!r}"
+            )
+        exp_res = expected_grid.get("res")
+        if exp_res is not None and not _res_close(recorded_grid.get("res"), exp_res):
+            reasons.append(
+                f"recorded grid resolution {recorded_grid.get('res')!r} != {list(exp_res)!r}"
+            )
 
     if record.get("valid_px") is None:
         reasons.append("valid_px not recorded")
@@ -279,21 +487,46 @@ def evaluate_pair_cache(
             reasons.append(f"{name} unreadable or corrupted")
             continue
         raster_meta[name] = meta
-        _validate_raster_against_grid(name, meta, expected_grid, reasons)
+        if grid_ok:
+            _validate_raster_against_grid(name, meta, expected_grid, reasons)
 
-    # 6. Grid consistency between the four rasters.
-    shapes = {name: tuple(meta["shape"]) for name, meta in raster_meta.items()}
-    if len(set(shapes.values())) > 1:
-        reasons.append(f"rasters disagree on shape: {shapes}")
+    # 6. Inter-raster grid consistency (CRS/transform/shape/resolution, not shape only).
+    if len(raster_meta) > 1:
+        ref_name, ref_meta = next(iter(raster_meta.items()))
+        for name, meta in raster_meta.items():
+            if name == ref_name:
+                continue
+            if meta["shape"] != ref_meta["shape"]:
+                reasons.append(f"{name} shape {meta['shape']!r} != {ref_name} shape {ref_meta['shape']!r}")
+            if not _transform_close(meta.get("transform"), ref_meta.get("transform")):
+                reasons.append(f"{name} transform differs from {ref_name}")
+            if not _crs_equal(meta.get("crs"), ref_meta.get("crs")):
+                reasons.append(f"{name} CRS differs from {ref_name}")
 
-    # 7. Nodata / binary semantics.
-    if not missing:
-        _validate_nodata_semantics(
+    # 7. Pixel-level semantics. Only meaningful when all four artifacts are
+    # present AND share an identical grid; otherwise the grid checks already
+    # marked the pair stale and a cross-raster pixel scan cannot be aligned.
+    all_same_grid = (
+        len(raster_meta) == len(REQUIRED_PAIR_ARTIFACTS)
+        and len({tuple(m["shape"]) for m in raster_meta.values()}) == 1
+        and all(_transform_close(m.get("transform"), next(iter(raster_meta.values())).get("transform"))
+                for m in raster_meta.values())
+    )
+    valid_px = None
+    if not missing and all_same_grid:
+        valid_px, _invalid_px = _validate_pixel_semantics(
             pair_dir,
             expected_ignore_value=expected_ignore_value,
-            expected_grid=expected_grid,
             reasons=reasons,
         )
+
+    # 8. Recorded valid_px must agree with the actual valid_mask count.
+    recorded_valid_px = record.get("valid_px")
+    if valid_px is not None and recorded_valid_px is not None:
+        if not _close(recorded_valid_px, valid_px, tol=0.5):
+            reasons.append(
+                f"recorded valid_px {recorded_valid_px!r} != actual valid_mask count {valid_px}"
+            )
 
     return CacheDecision(reusable=not reasons, stale_reasons=reasons)
 
@@ -317,7 +550,11 @@ def build_pair_record(
     source_hashes: dict | None = None,
     effective_config: dict | None = None,
 ) -> dict:
-    """Construct the per-pair metadata record written to the dataset manifest."""
+    """Construct the per-pair metadata record written to the dataset manifest.
+
+    ``valid_px`` must be the count of pixels where ``valid_mask.tif`` is 1
+    (the supervision-valid region).
+    """
     return {
         "pair_dir": str(pair_dir),
         "builder_version": builder_version,
@@ -342,15 +579,23 @@ def load_dataset_manifest(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def pair_record_for(manifest: dict, pair_dir: Path) -> dict | None:
     """Find a per-pair record by pair directory (string or resolved match)."""
+    if not isinstance(manifest, dict):
+        return None
+    pairs = manifest.get("pairs")
+    if not isinstance(pairs, list):
+        return None
     target = str(pair_dir)
-    for entry in manifest.get("pairs", []):
+    for entry in pairs:
+        if not isinstance(entry, dict):
+            continue
         if entry.get("pair_dir") == target:
             return entry
         try:

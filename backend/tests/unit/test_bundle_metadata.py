@@ -435,6 +435,41 @@ def test_zero_std_norm_stats_is_structured_failure(tmp_path, patched_manifest):
     assert report["ok"] is False
 
 
+def test_negative_std_norm_stats_is_structured_failure(tmp_path, patched_manifest):
+    root, _ = _setup(tmp_path, patched_manifest, stats=_valid_stats(std=[-1.0, 1.0]))
+    report = verify_bundle("9.9.9", root)
+    assert report["ok"] is False
+    assert report["metadata"]["norm_stats_structure"]["match"] is False
+
+
+@pytest.mark.parametrize("bad_checksum", ["xyz", "0" * 63, "0" * 65, 12345, None, "g" * 64])
+def test_malformed_manifest_checksum_formats_are_structured_failure(tmp_path, patched_manifest, bad_checksum):
+    version = "9.9.9"
+    root = _make_root(tmp_path, version)
+    bundle = root / "unet" / version
+    _write_synthetic_bundle(bundle, version=version)
+    manifest = _manifest_for(bundle, version)
+    manifest["bundles"][version]["checkpoint_sha256"] = bad_checksum
+    patched_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    report = verify_bundle(version, root)
+    assert report["ok"] is False
+    assert "malformed" in report["reason"]
+
+
+def test_checksum_mismatch_on_disk_is_structured_failure(tmp_path, patched_manifest):
+    """A syntactically valid checksum that does not match the file must fail."""
+    version = "9.9.9"
+    root = _make_root(tmp_path, version)
+    bundle = root / "unet" / version
+    _write_synthetic_bundle(bundle, version=version)
+    manifest = _manifest_for(bundle, version)
+    manifest["bundles"][version]["checkpoint_sha256"] = "a" * 64  # valid format, wrong value
+    patched_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    report = verify_bundle(version, root)
+    assert report["ok"] is False
+    assert report["checks"]["checkpoint.pt"]["match"] is False
+
+
 def test_config_not_a_json_object_is_structured_failure(tmp_path, patched_manifest):
     version = "9.9.9"
     root = _make_root(tmp_path, version)

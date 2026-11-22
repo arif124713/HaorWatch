@@ -88,27 +88,21 @@ stages:
   #    grid (CRS/transform/shape/resolution), SAR unit, ignore value, source    #
   #    dates, and builder version.                                              #
   #                                                                             #
-  #    Every declared parameter is passed EXPLICITLY to the script, so a        #
-  #    params.yaml change actually changes runtime behaviour. Booleans are       #
-  #    handled with DVC `--flag` (rebuild_stale=true adds --rebuild-stale;       #
-  #    false omits it).                                                         #
+  #    The command is a single stable wrapper (dvc_build_dataset.py). The       #
+  #    wrapper reads and validates params.yaml through build_config and forwards  #
+  #    every parameter explicitly, so a params.yaml change changes runtime       #
+  #    behaviour without relying on DVC-specific per-parameter command           #
+  #    templating (which is version/platform-sensitive for boolean flags).        #
+  #    All five parameters remain DVC stage dependencies.                        #
   # ------------------------------------------------------------------------- #
   build_hakaluki_v04_dataset:
     desc: >-
       Build S1/S2 same-day pairs with Sentinel-2 MNDWI>0 pseudo-labels, explicit
       validity masks, nodata-preserving reprojection, and a per-pair metadata
       contract. Requires Google Earth Engine credentials.
-    cmd:
-      - python backend/scripts/build_hakaluki_v04_dataset.py
-      - --out-dir backend/data/hakaluki_v04_dataset
-      - --version 0.4.0
-      - --sar-unit ${build.sar_unit}
-      - --s2-cloud-max ${build.s2_cloud_max}
-      - --pair-window-days ${build.pair_window_days}
-      - --label-ignore-value ${build.label_ignore_value}
-      - arg: --rebuild-stale
-        value: ${build.rebuild_stale}
+    cmd: python backend/scripts/dvc_build_dataset.py
     deps:
+      - backend/scripts/dvc_build_dataset.py
       - backend/scripts/build_hakaluki_v04_dataset.py
       - backend/app/ml/build_config.py
       - backend/app/ml/dataset_cache.py
@@ -116,11 +110,12 @@ stages:
       - backend/app/geospatial/reprojection.py
       - backend/data/hakaluki_aoi.geojson
     params:
-      - build.sar_unit
-      - build.s2_cloud_max
-      - build.pair_window_days
-      - build.label_ignore_value
-      - build.rebuild_stale
+      - params.yaml:
+          - build.sar_unit
+          - build.s2_cloud_max
+          - build.pair_window_days
+          - build.label_ignore_value
+          - build.rebuild_stale
     outs:
       - backend/data/hakaluki_v04_dataset:
           cache: false
