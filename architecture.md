@@ -101,9 +101,15 @@ Frontend does not perform raster processing or ML inference.
   - `0.1.0`, `0.2.0`, `0.3.0`: declare `s1_unit=dB` in both `config.json` and `norm_stats.json`.
   - `0.4.0`: a fine-tune of `0.1.0`. Its training used the `0.1.0` `norm_stats.json` (dB). The registered bundle initially shipped only `checkpoint.pt`/`config.json`/`metrics_eval.json` (no unit metadata). During staging validation the unit was established as `dB` from the base artifact and finetune script, and the bundle was completed with `norm_stats.json` (from `0.1.0`) and an explicit `s1_unit: "dB"` plus `s1_unit_provenance` in `config.json`. Model weights were not modified.
   - The `default.txt` pointer selects the active bundle; verify the selected bundle declares a unit before inference.
+- **Model artifact delivery strategy.** Model weights are **not** stored in Git (`backend/models/` and `*.pt` are gitignored) and are not in Git LFS. The tracked reproducibility manifest `app/ml/model_registry.py::bundles_manifest.json` records, for each version: required filenames, `s1_unit`, band order, probability threshold, base model, and SHA-256 checksums of `checkpoint.pt` and `norm_stats.json`. A deployment obtains bundles from the project's model artifact store (or regenerates them from the documented Kaggle notebooks) and places them at `backend/models/unet/<version>/`. `model_registry.verify_bundle(version, model_root)` verifies the on-disk artifacts against the manifest; `tests/unit/test_bundle_metadata.py` asserts the manifest is well-formed and, when bundles are present, that their checksums match.
 - **Legacy trainer note.** `kaggle/haorwatch_unet_training.py` is a standalone, historical Kaggle trainer that inferred the unit from a median heuristic (`assume_db`). It is not part of the runtime path and is preserved for reproducibility of the existing checkpoints; it is not used to produce or serve bundles and does not affect the runtime SAR-unit contract.
 - **Inference:** return a flood probability raster where practical, plus a thresholded class mask; record the probability threshold and post-processing. Keep U-Net output separate from Otsu baseline.
 - **Fallback rule:** if dataset audit reveals incompatible or insufficient labels, document the blocker and obtain an approved alternative labelled dataset or use the baseline for the demo. Do not claim U-Net was trained or validated unless the run and evidence exist.
+
+### Pseudo-label validity (Sentinel-2 reference)
+- The Hakaluki v0.4 dataset uses Sentinel-2 MNDWI>0 as an automatic (proxy) label. Invalid reference pixels (NaN/inf or numeric nodata sentinels such as `-9999`) and pixels outside the AOI or with invalid SAR must **never** be treated as non-water (0) labels.
+- `app/ml/labels.py` implements the validity rule: `build_validity_mask` intersects AOI ∧ valid SAR ∧ valid Sentinel-2; `apply_validity` writes the ignore sentinel `-1` for invalid pixels. The dataset builder writes `pseudo_label.tif` (with `-1` for invalid) and `valid_mask.tif`. The training loader uses `valid = finite(SAR) & (label != -1)` and, when present, intersects with `valid_mask.tif`. Invalid pixels are excluded from loss and metrics.
+- The existing `0.4.0` checkpoint was trained before this fix; it is not reinterpreted. Retraining (which would use the corrected labels) is required to benefit and is **not** performed here.
 
 ### Evaluation
 - Same held-out labelled samples and valid-pixel mask for ML and baseline.
@@ -120,6 +126,11 @@ Frontend does not perform raster processing or ML inference.
 2. Optical satellite proxy comparison (`proxy_validated`, e.g. Sentinel-2 MNDWI) — not ground truth.
 3. Independent external reference validation (`external_reference_checked`, e.g. Copernicus EMS/UNOSAT).
 A weaker category is never presented as a stronger one. Record dataset source/version, label source/semantics, annotation and observation dates, evaluated pixel/area coverage, model checkpoint hash, git commit SHA, preprocessing configuration, split identifiers, and metric definitions.
+
+### Observed U-Net / Otsu behaviour (staging diagnostics, not a performance claim)
+- On the held-out Ghana Sen1Floods11 chip (`data/prepared/ghana-demo`, single 2018-09-18 acquisition), preprocessing was confirmed correct (VV/VH dB, band order `VV_dB,VH_dB`, matching normalization). U-Net (threshold 0.4) predicts a small water fraction (~1.2%) while Otsu (`VH_dB`, water-is-low, ~-14.8 dB) predicts ~42%. Their **agreement** with each other is low (IoU ~0.03) because they sit at opposite precision/recall operating points, not because of a preprocessing error. Against the chip's hand labels U-Net had F1 ~0.29 / IoU ~0.17 and Otsu F1 ~0.19 / IoU ~0.11 (positive class = water, ~5.7% of valid pixels). Neither agreement nor these values establish superiority; thresholds were **not** tuned.
+- On the two Hakaluki operator tiles the operator labels are **positive-only**. U-Net predicted a very high water fraction (~72%), so it trivially attains recall 1.0 within the drawn polygons; this is positive-class agreement, not full binary accuracy, and it flags likely over-detection on Hakaluki SAR that positive-only labels cannot penalise. This is a limitation, not a validated result; no independent external reference was used.
+- These diagnostics separate agreement from ground-truth accuracy and do not claim Hakaluki performance from Ghana data or vice versa.
 
 ### Exposure calculation
 - Use ESA WorldCover class(es) from exact product legend/version. Class 40 is mapped cropland; it is a land-cover class, **not** a crop-specific (e.g. Boro rice) classification.
@@ -206,7 +217,12 @@ python -m scripts.seed_demo
 - Migrations use Alembic (`backend/alembic/versions/`). Apply with `alembic upgrade head`; roll back one revision with `alembic downgrade -1`.
 - `0002_report_run_language_unique` adds the `reports` unique constraint on `(analysis_run_id, language)`. Before adding the constraint it removes pre-existing duplicate report rows, keeping the earliest per `(analysis_run_id, language)` by `created_at, id` (deterministic; no non-report data is touched). The migration is reversible.
 - Never edit an applied migration; add a new revision. Existing report rows remain readable.
-- **Supported database:** PostgreSQL 16 or newer with PostGIS (for the geometry columns created in `0001_initial`). Verified on PostgreSQL 18.0 with PostGIS for migration `0002`.
+- **Supported database:** PostgreSQL 16 or newer with PostGIS (for the geometry columns created in `0001_initial`).
+- **Verification status (be precise):**
+  - Full migration chain `0001_initial` → `0002_report_run_language_unique`: executed and **verified** on PostgreSQL 18.0 with PostGIS 3.6.2 (extension present; geometry columns `study_areas.boundary` MULTIPOLYGON SRID 4326 and `analysis_layers.geometry` GEOMETRY SRID 4326; GiST indexes present; `uq_report_run_language` present; downgrade to `0001_initial` and re-upgrade both succeed).
+  - Report unique constraint (plain PostgreSQL): verified by the isolated-schema integration test.
+  - `ReportService` concurrency over the full ORM schema: verified against the migrated PostGIS database.
+  - Earlier isolated runs of migration `0002` core SQL on a plain `reports` table are superseded by the full-chain verification above.
 
 ### Database integration tests
 - Unit tests run without a database. Any test that needs PostgreSQL is skipped unless `HAORWATCH_TEST_DATABASE_URL` points at a reachable database, e.g.:

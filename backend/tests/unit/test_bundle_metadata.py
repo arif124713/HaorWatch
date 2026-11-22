@@ -10,6 +10,7 @@ import pytest
 
 from app.ml.features import normalize_unit
 from app.ml.inference import load_bundle
+from app.ml.model_registry import load_bundle_manifest, verify_bundle
 
 import json
 
@@ -20,6 +21,25 @@ def _bundle_dirs():
     if not MODEL_ROOT.is_dir():
         return []
     return [d for d in MODEL_ROOT.iterdir() if d.is_dir() and (d / "checkpoint.pt").exists()]
+
+
+def test_tracked_manifest_is_wellformed():
+    manifest = load_bundle_manifest()
+    assert manifest["schema_version"] >= 1
+    assert manifest["default_version"] in manifest["bundles"]
+    for version, entry in manifest["bundles"].items():
+        assert entry["s1_unit"] in ("dB", "linear"), version
+        assert entry["checkpoint_sha256"]
+
+
+@pytest.mark.skipif(not _bundle_dirs(), reason="No model bundles present.")
+def test_tracked_manifest_checksums_match_disk():
+    manifest = load_bundle_manifest()
+    for bundle_dir in _bundle_dirs():
+        version = bundle_dir.name
+        assert version in manifest["bundles"], f"{version} missing from bundles_manifest.json"
+        report = verify_bundle(version, MODEL_ROOT.parent)
+        assert report["ok"], f"{version} bundle checksum verification failed: {report}"
 
 
 @pytest.mark.skipif(not _bundle_dirs(), reason="No model bundles present.")

@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "description": "Reproducibility manifest for HaorWatch U-Net model bundles. Model weights are NOT stored in Git (backend/models/ and *.pt are gitignored). This manifest records the expected artifact filenames, checksums and metadata so a deployment can verify a bundle obtained from the artifact source.",
+  "artifact_source": {
+    "policy": "external-artifact",
+    "detail": "Bundles are produced by scripts.train_model --register <src_dir> from the Kaggle training outputs and stored under backend/models/unet/<version>/. Weights are not redistributed in Git; obtain them from the project's model artifact store (or regenerate from the documented Kaggle notebooks) and place them at backend/models/unet/<version>/.",
+    "required_files": ["checkpoint.pt", "config.json", "norm_stats.json"],
+    "optional_files": ["manifest.json", "metrics_eval.json"]
+  },
+  "default_version": "0.1.0",
+  "bundles": {
+    "0.1.0": {
+      "base_model": null,
+      "dataset": "Sen1Floods11 v1.1 (HandLabeled)",
+      "s1_unit": "dB",
+      "band_order": ["VV_dB", "VH_dB"],
+      "probability_threshold": 0.4,
+      "checkpoint_sha256": "834ae7578d625b4d58cb1c736bf5ab93753f1c08a27edcb7eeb2fa933299977c",
+      "norm_stats_sha256": "6c9013d86377a97198aa4ba6992cd55fc383ea9534d10a9f5b60effb7feb26df"
+    },
+    "0.2.0": {
+      "base_model": "0.1.0",
+      "dataset": "Sen1Floods11 v1.1 (HandLabeled)",
+      "s1_unit": "dB",
+      "band_order": ["VV_dB", "VH_dB"],
+      "probability_threshold": 0.55,
+      "checkpoint_sha256": "56251cd8cd6cd5a7ed5b0e542c8210bc10785b2b303347435ef8d2e3508ae75f",
+      "norm_stats_sha256": "6c9013d86377a97198aa4ba6992cd55fc383ea9534d10a9f5b60effb7feb26df"
+    },
+    "0.3.0": {
+      "base_model": "0.1.0",
+      "dataset": "Sen1Floods11 v1.1 (HandLabeled)",
+      "s1_unit": "dB",
+      "band_order": ["VV_dB", "VH_dB"],
+      "probability_threshold": 0.55,
+      "checkpoint_sha256": "51e7c5dff0bf3d2b46cfbfb7f963726babbb44b6907bf2c4fe8b5c76ae3f0ee0",
+      "norm_stats_sha256": "6c9013d86377a97198aa4ba6992cd55fc383ea9534d10a9f5b60effb7feb26df"
+    },
+    "0.4.0": {
+      "base_model": "0.1.0",
+      "dataset": "Hakaluki AOI S1/S2 same-day pairs, Sentinel-2 MNDWI>0 pseudo-labels (fine-tune of 0.1.0)",
+      "s1_unit": "dB",
+      "s1_unit_provenance": "Fine-tuned from 0.1.0 which declares s1_unit=dB; fine-tune normalized inputs with the 0.1.0 norm_stats.json (dB). Metadata completed during staging validation; weights unchanged.",
+      "band_order": ["VV_dB", "VH_dB"],
+      "probability_threshold": 0.4,
+      "checkpoint_sha256": "15c9eaea1bb99071281b80d622e6c83e7f9f61edcac2ad49e3d210b14bddd029",
+      "norm_stats_sha256": "6c9013d86377a97198aa4ba6992cd55fc383ea9534d10a9f5b60effb7feb26df"
+    }
+  }
+}

@@ -98,7 +98,14 @@ class PairDataset(Dataset):
         with rasterio.open(pair_dir / "pseudo_label.tif") as src:
             label = src.read(1).astype(np.float32)
 
-        valid = np.isfinite(image).all(axis=0)
+        # Supervision validity = valid SAR ∧ valid label. Invalid Sentinel-2
+        # reference pixels are stored as the ignore sentinel (-1) in the label
+        # and must be excluded, never treated as non-water.
+        valid = np.isfinite(image).all(axis=0) & (label != -1)
+        valid_mask_path = pair_dir / "valid_mask.tif"
+        if valid_mask_path.exists():
+            with rasterio.open(valid_mask_path) as src:
+                valid = valid & (src.read(1) > 0.5)
         for band_index in range(image.shape[0]):
             band = image[band_index]
             if not looks_like_db(band):

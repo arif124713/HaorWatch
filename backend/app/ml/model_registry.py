@@ -6,6 +6,8 @@ import shutil
 
 BUNDLE_FILES = ["checkpoint.pt", "config.json", "norm_stats.json"]
 
+MANIFEST_PATH = Path(__file__).resolve().parent / "bundles_manifest.json"
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -13,6 +15,38 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def load_bundle_manifest() -> dict:
+    """Load the tracked reproducibility manifest of model bundles."""
+    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+
+
+def verify_bundle(version: str, model_root: str | Path) -> dict:
+    """Verify an on-disk bundle against the tracked manifest checksums.
+
+    Returns a report dict with ``ok`` plus per-file checks. A missing artifact or
+    a checksum mismatch is reported, never silently ignored.
+    """
+    manifest = load_bundle_manifest()
+    expected = manifest.get("bundles", {}).get(version)
+    if expected is None:
+        return {"ok": False, "reason": f"version {version!r} not in bundles_manifest.json"}
+    bundle_dir = Path(model_root) / "unet" / version
+    report = {"ok": True, "version": version, "checks": {}}
+    for name, key in (("checkpoint.pt", "checkpoint_sha256"), ("norm_stats.json", "norm_stats_sha256")):
+        path = bundle_dir / name
+        if not path.exists():
+            report["checks"][name] = "missing"
+            report["ok"] = False
+            continue
+        actual = _sha256(path)
+        expected_hash = expected.get(key)
+        match = expected_hash is not None and actual == expected_hash
+        report["checks"][name] = {"actual": actual, "expected": expected_hash, "match": match}
+        if not match:
+            report["ok"] = False
+    return report
 
 
 def register_bundle(src_dir: str | Path, model_root: str | Path, version: str | None = None) -> Path:

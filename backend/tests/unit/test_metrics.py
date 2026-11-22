@@ -3,6 +3,7 @@ import pytest
 
 from app.ml.evaluate import (
     annotated_confusion_counts,
+    annotation_positive_agreement,
     classification_metrics,
     confusion_counts,
     evaluate_mask,
@@ -135,3 +136,31 @@ def test_annotated_metrics_catch_false_positives_outside_positive_polygon():
     metrics = classification_metrics(counts)
     assert counts["false_positive"] == 3
     assert metrics["precision"] == pytest.approx(0.25)
+
+
+def test_positive_only_agreement_excludes_unannotated_and_reports_no_fp():
+    # 5 valid pixels; only pixels 0..2 are inside positive polygons.
+    pred = np.array([[1, 0, 1, 1, 1]])
+    positive = np.array([[1, 1, 0, 0, 0]])
+    valid = np.ones((1, 5), dtype=bool)
+    m = annotation_positive_agreement(pred, positive, valid)
+    assert m["true_positive"] == 1
+    assert m["false_negative"] == 1
+    # No negative class annotated -> FP/TN are zero by construction.
+    assert m["false_positive"] == 0
+    assert m["true_negative"] == 0
+    assert m["annotated_pixel_count"] == 2
+    assert m["unannotated_valid_pixel_count"] == 3
+    assert m["recall"] == pytest.approx(0.5)
+    assert m["precision"] == pytest.approx(1.0)
+
+
+def test_positive_only_agreement_all_predicted_positive_is_recall_one():
+    # A model that floods everything gets recall 1.0 on positive-only labels,
+    # which is exactly why positive-only agreement is not full accuracy.
+    pred = np.ones((1, 4), dtype=bool)
+    positive = np.array([[1, 1, 0, 0]])
+    valid = np.ones((1, 4), dtype=bool)
+    m = annotation_positive_agreement(pred, positive, valid)
+    assert m["recall"] == 1.0
+    assert m["false_negative"] == 0

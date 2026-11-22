@@ -31,6 +31,37 @@ def confusion_counts(pred: np.ndarray, label: np.ndarray, valid: np.ndarray) -> 
     return {"true_positive": tp, "false_positive": fp, "true_negative": tn, "false_negative": fn}
 
 
+def annotation_positive_agreement(
+    pred: np.ndarray,
+    positive: np.ndarray,
+    valid: np.ndarray,
+) -> dict:
+    """Metrics for **positive-only** annotations, evaluated over annotated pixels.
+
+    Only pixels inside the positive annotation polygons contribute: TP and FN are
+    counted there; unannotated valid pixels are excluded entirely and are **not**
+    treated as background (so no false negatives/true negatives are fabricated
+    from them). Because no negative class is annotated, precision/recall/F1/IoU
+    here are *positive-class agreement*, not full binary classification accuracy,
+    and ``false_positive``/``true_negative`` are reported as 0 by construction.
+    """
+    in_valid = valid.astype(bool)
+    pos = positive.astype(bool) & in_valid
+    pred_b = pred.astype(bool)
+    tp = int(np.logical_and(pred_b, pos).sum())
+    fn = int(np.logical_and(~pred_b, pos).sum())
+    counts = {
+        "true_positive": tp,
+        "false_positive": 0,
+        "true_negative": 0,
+        "false_negative": fn,
+        "annotated_pixel_count": tp + fn,
+        "unannotated_valid_pixel_count": int((in_valid & ~positive.astype(bool)).sum()),
+    }
+    metrics = classification_metrics(counts)
+    return {**metrics, **counts}
+
+
 def annotated_confusion_counts(
     pred: np.ndarray,
     positive: np.ndarray,

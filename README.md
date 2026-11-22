@@ -66,8 +66,10 @@ HAORWATCH_TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:543
 
 ### Verification status
 - Unit suite: implemented and passing without a database.
-- Database (PostgreSQL) integration: implemented; requires `HAORWATCH_TEST_DATABASE_URL`. The `reports` unique constraint and concurrent-insert behaviour were verified against PostgreSQL.
-- Migrations: Alembic `0001_initial` → `0002_report_run_language_unique`; single head; upgrade/downgrade validated.
-- Local real-data pipeline: validated on the documented prepared demo bundle with the real checkpoint (stages only; not the live GEE/Sentinel-1 acquisition path).
-- Live GEE/Sentinel-1 acquisition and a full PostGIS-schema end-to-end run: not verified here (require external credentials/data).
+- Database integration: tests run against a real PostgreSQL and isolate their own schema (never drop public tables); require `HAORWATCH_TEST_DATABASE_URL`.
+- Migrations: Alembic `0001_initial` → `0002_report_run_language_unique`; single head. The **full chain including PostGIS** (extension, geometry columns, GiST indexes) was executed and verified on PostgreSQL 18.0 + PostGIS 3.6.2, including downgrade/re-upgrade.
+- Report `ReportService` concurrency over the full ORM schema: verified on the migrated PostGIS database.
+- Model bundles: weights are not in Git; the tracked manifest `app/ml/model_registry.py::bundles_manifest.json` records filenames and SHA-256 checksums; every loadable bundle declares `s1_unit=dB`.
+- Local real-data pipeline: validated on the documented prepared bundles with the real checkpoint (stages only; not the live GEE/Sentinel-1 acquisition path).
+- Live GEE/Sentinel-1 acquisition: not verified here (requires external credentials/data).
 

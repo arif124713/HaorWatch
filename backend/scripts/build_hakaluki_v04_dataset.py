@@ -19,6 +19,7 @@ from app.geospatial.reprojection import reproject_array, reproject_geometry, utm
 from app.geospatial.raster_io import write_raster
 from app.integrations.gee_client import GEEClient
 from app.ml.features import ensure_db
+from app.ml.labels import IGNORE_LABEL, S2_NODATA_SENTINELS, apply_validity, build_validity_mask
 
 AOI_PATH = Path(r"data\hakaluki_aoi.geojson")
 OUT = Path(r"data\hakaluki_v04_dataset")
@@ -26,6 +27,11 @@ S2_CLOUD_MAX = 12
 WINDOW_DAYS = 1
 # GEE COPERNICUS/S1_GRD VV/VH are dB backscatter. Declared explicitly; never guessed.
 SAR_UNIT = "dB"
+# Sentinel-2 export nodata sentinels that are finite but invalid. Any pixel equal
+# to one of these must NOT be treated as a valid non-water (0) label.
+S2_NODATA_SENTINELS = (-9999.0, -32768.0, -3.4028235e38)
+# Value written for pixels excluded from supervision (ignored by the loader).
+IGNORE_LABEL = -1.0
 
 settings = get_settings()
 client = GEEClient(settings.google_earth_engine_project)
@@ -156,19 +162,30 @@ for index, (s1_day, s2_day) in enumerate(pairs):
         ref_crs = src.crs
     if reference.shape != grid_shape or ref_crs.to_string() != utm_crs:
         reference = reproject_array(reference, ref_transform, ref_crs, grid_transform, utm_crs, grid_shape)
-    reference = np.where(np.isfinite(reference), reference, 0.0).astype(np.float32)
-    write_raster(pair_dir / "pseudo_label.tif", reference, grid_transform, utm_crs)
+    # Explicit validity mask: AOI ∧ valid SAR ∧ valid (finite, non-sentinel) S2.
+    # Invalid S2 pixels must never silently become non-water (0) labels.
+    pair_valid = build_validity_mask(valid, reference, aoi_mask)
+    reference = np.where(np.isfinite(reference), reference, np.nan).astype(np.float32)
+    label = apply_validity(reference, pair_valid)
+    write_raster(pair_dir / "pseudo_label.tif", label, grid_transform, utm_crs, dtype="float32", nodata=IGNORE_LABEL)
+    write_raster(
+        pair_dir / "valid_mask.tif", pair_valid.astype(np.float32),
+        grid_transform, utm_crs, dtype="float32", nodata=0.0,
+    )
 
-    water_px = int((reference > 0.5).sum())
+    water_px = int(((label > 0.5) & pair_valid).sum())
+    invalid_px = int((~pair_valid).sum())
     manifest["pairs"].append({
         "pair_dir": str(pair_dir),
         "s1_day": s1_day,
         "s2_day": s2_day,
         "s1_meta": s1_meta,
         "water_px": water_px,
-        "valid_px": int(valid.sum()),
+        "valid_px": int(pair_valid.sum()),
+        "invalid_px": invalid_px,
+        "label_ignore_value": IGNORE_LABEL,
     })
-    print(f"pair {index:02d}: S1 {s1_day} ({s1_meta['image_count']} scenes) <-> S2 {s2_day}, water {water_px / max(int(valid.sum()), 1) * 100:.1f}%")
+    print(f"pair {index:02d}: S1 {s1_day} ({s1_meta['image_count']} scenes) <-> S2 {s2_day}, water {water_px / max(int(pair_valid.sum()), 1) * 100:.1f}% (invalid {invalid_px})")
 
 (OUT / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
