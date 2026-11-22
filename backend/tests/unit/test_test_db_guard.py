@@ -86,3 +86,95 @@ def test_resolve_target_without_url_is_unavailable(fresh_guard, monkeypatch):
     target = guard.resolve_target()
     assert not target.available
     assert target.skip_reason is not None
+
+
+# --------------------------------------------------------------------------- #
+# PostGIS / search_path construction
+# --------------------------------------------------------------------------- #
+
+def test_quote_ident_quotes_and_rejects_unsafe():
+    assert _test_db.quote_ident("haorwatch_test_abc") == '"haorwatch_test_abc"'
+    for unsafe in ("bad name", "bad;drop", "", "a-b"):
+        with pytest.raises(ValueError):
+            _test_db.quote_ident(unsafe)
+
+
+def test_build_search_path_isolated_first_public_last():
+    path = _test_db.build_search_path("haorwatch_test_abc", ("postgis_schema",))
+    assert path == '"haorwatch_test_abc", "postgis_schema", "public"'
+
+
+def test_build_search_path_does_not_assume_public_for_extension():
+    # Extension installed in a non-public schema: isolated schema first, then the
+    # actual extension schema, then public.
+    path = _test_db.build_search_path("isolated_x", ("extensions",))
+    assert path.startswith('"isolated_x"')
+    assert '"extensions"' in path
+    assert path.endswith('"public"')
+
+
+def test_build_search_path_deduplicates():
+    path = _test_db.build_search_path("iso", ("iso", "public"))
+    assert path == '"iso", "public"'
+
+
+def test_build_search_path_with_no_extension_schemas():
+    assert _test_db.build_search_path("iso") == '"iso", "public"'
+
+
+class _FakeResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar(self):
+        return self._value
+
+
+class _FakeConn:
+    def __init__(self, mapping):
+        self._mapping = mapping
+
+    def execute(self, _stmt, params):
+        return _FakeResult(self._mapping.get(params["name"]))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeEngine:
+    def __init__(self, mapping):
+        self._mapping = mapping
+
+    def connect(self):
+        return _FakeConn(self._mapping)
+
+
+def test_discover_extension_schemas_finds_non_public_schema():
+    engine = _FakeEngine({"postgis": "extensions"})
+    assert _test_db.discover_extension_schemas(engine) == ("extensions",)
+
+
+def test_discover_extension_schemas_falls_back_to_public():
+    engine = _FakeEngine({})
+    assert _test_db.discover_extension_schemas(engine) == ("public",)
+
+
+def test_discover_extension_schemas_handles_query_error(monkeypatch):
+    class _RaisingConn:
+        def execute(self, *_a, **_k):
+            raise RuntimeError("catalog unavailable")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _RaisingEngine:
+        def connect(self):
+            return _RaisingConn()
+
+    assert _test_db.discover_extension_schemas(_RaisingEngine()) == ("public",)

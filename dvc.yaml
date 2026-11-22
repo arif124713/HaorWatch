@@ -83,20 +83,34 @@ stages:
   # ------------------------------------------------------------------------- #
   # 5. Build the Hakaluki v0.4 S1/S2 pseudo-label dataset (GEE required).      #
   #    Enforces the cache-validity contract: a cached pair is reused only when #
-  #    it contains valid_mask.tif AND its metadata matches the expected grid,  #
-  #    SAR unit, ignore value, source dates, and builder version.              #
+  #    it contains ALL FOUR required artifacts (s1_grid.tif, pseudo_label.tif,  #
+  #    valid_mask.tif, s1_valid_mask.tif) AND its metadata matches the expected #
+  #    grid (CRS/transform/shape/resolution), SAR unit, ignore value, source    #
+  #    dates, and builder version.                                              #
+  #                                                                             #
+  #    Every declared parameter is passed EXPLICITLY to the script, so a        #
+  #    params.yaml change actually changes runtime behaviour. Booleans are       #
+  #    handled with DVC `--flag` (rebuild_stale=true adds --rebuild-stale;       #
+  #    false omits it).                                                         #
   # ------------------------------------------------------------------------- #
   build_hakaluki_v04_dataset:
     desc: >-
       Build S1/S2 same-day pairs with Sentinel-2 MNDWI>0 pseudo-labels, explicit
       validity masks, nodata-preserving reprojection, and a per-pair metadata
       contract. Requires Google Earth Engine credentials.
-    cmd: >-
-      python backend/scripts/build_hakaluki_v04_dataset.py
-      --out-dir backend/data/hakaluki_v04_dataset
-      --version 0.4.0
+    cmd:
+      - python backend/scripts/build_hakaluki_v04_dataset.py
+      - --out-dir backend/data/hakaluki_v04_dataset
+      - --version 0.4.0
+      - --sar-unit ${build.sar_unit}
+      - --s2-cloud-max ${build.s2_cloud_max}
+      - --pair-window-days ${build.pair_window_days}
+      - --label-ignore-value ${build.label_ignore_value}
+      - arg: --rebuild-stale
+        value: ${build.rebuild_stale}
     deps:
       - backend/scripts/build_hakaluki_v04_dataset.py
+      - backend/app/ml/build_config.py
       - backend/app/ml/dataset_cache.py
       - backend/app/ml/labels.py
       - backend/app/geospatial/reprojection.py

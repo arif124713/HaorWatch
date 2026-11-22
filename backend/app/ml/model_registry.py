@@ -38,6 +38,83 @@ _ARTIFACT_CHECKSUM_FIELDS = (
     ("norm_stats.json", "norm_stats_sha256"),
 )
 
+# Valid Sentinel-1 band identifiers for band_order validation.
+_VALID_BAND_IDENTIFIERS = ("VV", "VH", "VVP", "VHP", "VV_DB", "VH_DB")
+_HEX_DIGITS = set("0123456789abcdef")
+
+
+def _is_sha256_hex(value) -> bool:
+    """True only for a 64-character lowercase hex SHA-256 string."""
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(ch in _HEX_DIGITS for ch in value.lower())
+
+
+def _finite_number(value, *, allow_string: bool = False) -> float | None:
+    """Return the value as a finite float, or None when it is not numeric/finite.
+
+    When ``allow_string`` is false (the default) a numeric string such as
+    ``"0.4"`` is rejected: typed metadata must be declared with the correct JSON
+    type, not a string that happens to parse.
+    """
+    import math
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not allow_string:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _valid_band_order(order) -> list[str] | None:
+    """Return a normalised band_order list when it is valid, else None.
+
+    A valid band order is a non-empty list (or comma string) of recognised SAR
+    band identifiers. A dict, a number, an empty list, or an unknown identifier
+    is invalid.
+    """
+    if isinstance(order, dict) or isinstance(order, (int, float, bool)):
+        return None
+    if isinstance(order, str):
+        order = [order]
+    if not isinstance(order, (list, tuple)) or len(order) == 0:
+        return None
+    normalized = []
+    for item in order:
+        if not isinstance(item, str) or not item.strip():
+            return None
+        normalized.append(item.strip())
+    # Every identifier must be a recognised SAR band (case-insensitive).
+    for item in normalized:
+        if item.upper().replace("-", "_") not in _VALID_BAND_IDENTIFIERS:
+            return None
+    return normalized
+
+
+def _validate_norm_stats(stats) -> tuple[bool, str]:
+    """Validate norm-stats structure: object with finite numeric mean/std lists."""
+    if not isinstance(stats, dict):
+        return False, "norm_stats is not a JSON object"
+    mean = stats.get("mean")
+    std = stats.get("std")
+    if not isinstance(mean, list) or not isinstance(std, list) or not mean or not std:
+        return False, "norm_stats must have non-empty 'mean' and 'std' lists"
+    if len(mean) != len(std):
+        return False, "norm_stats 'mean' and 'std' must have equal length"
+    for value in list(mean) + list(std):
+        if _finite_number(value) is None:
+            return False, f"norm_stats contains a non-finite or non-numeric value {value!r}"
+    for value in std:
+        if float(value) <= 0.0:
+            return False, f"norm_stats 'std' must be positive, found {value!r}"
+    return True, ""
+
 
 class BundleVerificationError(RuntimeError):
     """Raised when a bundle fails manifest verification (fail-closed)."""
@@ -80,6 +157,38 @@ def _units_agree(left, right) -> bool:
         return False
 
 
+def _validate_manifest_entry(expected: dict, version: str) -> list[str]:
+    """Validate the manifest entry's metadata types; return issue descriptions."""
+    issues: list[str] = []
+
+    if not isinstance(expected.get("model_version"), str) or not expected["model_version"].strip():
+        issues.append("model_version must be a non-empty string")
+    elif expected["model_version"] != version:
+        issues.append(f"model_version {expected['model_version']!r} != requested {version!r}")
+
+    try:
+        from app.ml.features import normalize_unit
+
+        normalize_unit(expected.get("s1_unit"))
+    except Exception:  # noqa: BLE001 - unknown/missing unit is a manifest issue
+        issues.append(f"s1_unit {expected.get('s1_unit')!r} is not a supported unit")
+
+    if _valid_band_order(expected.get("band_order")) is None:
+        issues.append(f"band_order {expected.get('band_order')!r} is not a non-empty list of valid bands")
+
+    threshold = _finite_number(expected.get("probability_threshold"))
+    if threshold is None:
+        issues.append(f"probability_threshold {expected.get('probability_threshold')!r} is not numeric/finite")
+    elif not (0.0 <= threshold <= 1.0):
+        issues.append(f"probability_threshold {threshold!r} is outside [0, 1]")
+
+    for key in ("checkpoint_sha256", "config_sha256", "norm_stats_sha256"):
+        if not _is_sha256_hex(expected.get(key)):
+            issues.append(f"{key} is not a valid SHA-256 hex string")
+
+    return issues
+
+
 def verify_bundle(version: str, model_root: str | Path) -> dict:
     """Verify an on-disk bundle against the tracked manifest checksums and metadata.
 
@@ -88,9 +197,17 @@ def verify_bundle(version: str, model_root: str | Path) -> dict:
     manifest is reported and flips ``ok`` to ``False``; nothing is silently
     ignored.
     """
-    manifest = load_bundle_manifest()
-    expected = manifest.get("bundles", {}).get(version)
-    if expected is None:
+    try:
+        manifest = load_bundle_manifest()
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "version": version, "reason": f"bundles_manifest.json is not valid JSON: {exc}"}
+    if not isinstance(manifest, dict):
+        return {"ok": False, "version": version, "reason": "bundles_manifest.json is not a JSON object"}
+    bundles = manifest.get("bundles")
+    if not isinstance(bundles, dict):
+        return {"ok": False, "version": version, "reason": "bundles_manifest.json has no 'bundles' object"}
+    expected = bundles.get(version)
+    if not isinstance(expected, dict):
         return {"ok": False, "version": version, "reason": f"version {version!r} not in bundles_manifest.json"}
 
     missing_fields = [field for field in REQUIRED_MANIFEST_FIELDS if field not in expected]
@@ -99,6 +216,17 @@ def verify_bundle(version: str, model_root: str | Path) -> dict:
             "ok": False,
             "version": version,
             "reason": f"manifest entry for {version!r} is missing required fields: {missing_fields}",
+        }
+
+    # Validate the manifest's own metadata types before comparing anything, so a
+    # malformed manifest is a structured failure rather than a raw exception.
+    manifest_issues = _validate_manifest_entry(expected, version)
+    if manifest_issues:
+        return {
+            "ok": False,
+            "version": version,
+            "reason": f"manifest entry for {version!r} is malformed: {manifest_issues}",
+            "metadata": {"manifest_issues": manifest_issues},
         }
 
     bundle_dir = Path(model_root) / "unet" / version
@@ -119,6 +247,8 @@ def verify_bundle(version: str, model_root: str | Path) -> dict:
             report["ok"] = False
 
     # 2. Cross-check on-disk artifact metadata with the manifest contract.
+    # JSON parse errors are expected validation failures; unexpected exceptions
+    # (e.g. an out-of-memory or programming error) are not swallowed.
     config_path = bundle_dir / "config.json"
     stats_path = bundle_dir / "norm_stats.json"
     config = stats = None
@@ -135,10 +265,15 @@ def verify_bundle(version: str, model_root: str | Path) -> dict:
             report["metadata"]["norm_stats_json"] = "unparseable"
             report["ok"] = False
 
+    if config is not None and not isinstance(config, dict):
+        report["metadata"]["config_json"] = "not a JSON object"
+        report["ok"] = False
+        config = None
+
     if config is not None:
         # Model version.
         cfg_version = config.get("model_version")
-        version_ok = cfg_version == expected["model_version"] == version
+        version_ok = isinstance(cfg_version, str) and cfg_version == expected["model_version"] == version
         report["metadata"]["model_version"] = {
             "config": cfg_version,
             "manifest": expected["model_version"],
@@ -158,32 +293,44 @@ def verify_bundle(version: str, model_root: str | Path) -> dict:
         if not unit_ok:
             report["ok"] = False
 
-        # Band order (config vs manifest), order-sensitive.
-        cfg_bands = _normalize_band_order(config.get("band_order"))
-        band_ok = cfg_bands == _normalize_band_order(expected["band_order"])
+        # Band order (config vs manifest), order-sensitive and type-validated.
+        cfg_bands = _valid_band_order(config.get("band_order"))
+        band_ok = cfg_bands is not None and cfg_bands == _normalize_band_order(expected["band_order"])
         report["metadata"]["band_order"] = {
-            "config": cfg_bands,
+            "config": cfg_bands if cfg_bands is not None else config.get("band_order"),
             "manifest": expected["band_order"],
             "match": band_ok,
         }
         if not band_ok:
             report["ok"] = False
 
-        # Probability threshold (config vs manifest).
-        cfg_threshold = config.get("probability_threshold")
+        # Probability threshold (config vs manifest): must be numeric + in range.
+        cfg_threshold_number = _finite_number(config.get("probability_threshold"))
         threshold_ok = (
-            cfg_threshold is not None
-            and abs(float(cfg_threshold) - float(expected["probability_threshold"])) < 1e-9
+            cfg_threshold_number is not None
+            and 0.0 <= cfg_threshold_number <= 1.0
+            and abs(cfg_threshold_number - float(expected["probability_threshold"])) < 1e-9
         )
         report["metadata"]["probability_threshold"] = {
-            "config": cfg_threshold,
+            "config": config.get("probability_threshold"),
             "manifest": expected["probability_threshold"],
             "match": threshold_ok,
         }
         if not threshold_ok:
             report["ok"] = False
 
+    if stats is not None and not isinstance(stats, dict):
+        report["metadata"]["norm_stats_json"] = "not a JSON object"
+        report["ok"] = False
+        stats = None
+
     if stats is not None:
+        # Norm-stats structure must be valid (finite mean/std, positive std).
+        stats_ok, stats_issue = _validate_norm_stats(stats)
+        report["metadata"]["norm_stats_structure"] = {"match": stats_ok, "issue": stats_issue}
+        if not stats_ok:
+            report["ok"] = False
+
         # Norm stats unit vs manifest unit.
         stats_unit_ok = _units_agree(stats.get("s1_unit"), expected["s1_unit"])
         report["metadata"]["norm_stats_s1_unit"] = {

@@ -21,6 +21,14 @@ database level (e.g. ``CREATE EXTENSION postgis``), which the migrated
 application database already has. The schema itself is still fully isolated; the
 test skips with a clear reason if PostGIS is unavailable.
 
+The PostGIS extension is **not** assumed to live in ``public``. The test
+discovers the extension's installation schema from ``pg_extension``/
+``pg_namespace`` and sets each connection's ``search_path`` to
+``<isolated schema>, <extension schema(s)>, public`` so SQLAlchemy can resolve
+the ``geometry`` type while unqualified application tables still resolve to the
+isolated schema first. The PostGIS extension itself is never created, dropped,
+or modified.
+
 Determinism
 -----------
 The race is synchronised at the repository boundary using the test-only
@@ -43,7 +51,12 @@ from app.models import AnalysisRun, Base, Report, StudyArea
 from app.repositories.analysis import AnalysisRepository
 from app.services.report_service import ReportService
 
-from tests.integration._test_db import resolve_target
+from tests.integration._test_db import (
+    build_search_path,
+    discover_extension_schemas,
+    quote_ident,
+    resolve_target,
+)
 
 _TARGET = resolve_target()
 
@@ -51,13 +64,6 @@ pytestmark = pytest.mark.skipif(
     _TARGET.skip_reason is not None,
     reason=_TARGET.skip_reason or "",
 )
-
-
-def _ident(name: str) -> str:
-    """Safely quote a locally-generated (uuid-derived) schema identifier."""
-    if not name.replace("_", "").isalnum():
-        raise ValueError(f"unsafe schema identifier: {name!r}")
-    return '"' + name + '"'
 
 
 class _DeterministicLLM:
@@ -76,8 +82,17 @@ class _DeterministicLLM:
 def schema_engine():
     """Create an isolated schema with the full ORM schema; drop only it after."""
     schema = f"haorwatch_test_{uuid.uuid4().hex[:12]}"
-    quoted = _ident(schema)
+    quoted = quote_ident(schema)
     admin = create_engine(_TARGET.url)
+
+    # Discover where PostGIS actually lives (it is not assumed to be in public).
+    try:
+        extension_schemas = discover_extension_schemas(admin)
+    except Exception:  # noqa: BLE001
+        admin.dispose()
+        pytest.skip("could not query extension schemas; database not usable")
+    search_path = build_search_path(schema, extension_schemas)
+
     try:
         with admin.begin() as conn:
             conn.execute(text(f"CREATE SCHEMA {quoted}"))
@@ -91,23 +106,43 @@ def schema_engine():
     def _set_search_path(dbapi_conn, _rec):  # noqa: ANN001
         cur = dbapi_conn.cursor()
         try:
-            cur.execute(f"SET search_path TO {quoted}")
+            cur.execute(f"SET search_path TO {search_path}")
         finally:
             cur.close()
 
     try:
         # Real ORM tables, created inside the isolated schema. Unqualified
-        # foreign keys resolve within the same schema because search_path is set.
+        # application tables resolve to the isolated schema first (search_path
+        # order) while the geometry type resolves via the extension schema.
         try:
             Base.metadata.create_all(engine)
         except Exception as exc:  # noqa: BLE001
             pytest.skip(f"could not create ORM tables (PostGIS may be missing): {type(exc).__name__}")
+
+        # Confirm the ORM tables were created inside the isolated schema only.
+        created = _tables_in_schema(engine, schema)
+        expected = set(Base.metadata.tables.keys())
+        if not expected.issubset(created):
+            pytest.skip(f"isolated schema missing ORM tables: {sorted(expected - created)}")
         yield schema, engine
     finally:
         engine.dispose()
         with admin.begin() as conn:
             conn.execute(text(f"DROP SCHEMA IF EXISTS {quoted} CASCADE"))
         admin.dispose()
+
+
+def _tables_in_schema(engine, schema: str) -> set[str]:
+    """Return the set of application table names created in ``schema``."""
+    from sqlalchemy import inspect
+
+    inspector = inspect(engine)
+    names = set(inspector.get_table_names(schema=schema))
+    # Advanced SQLAlchemy may expose non-public tables without a schema arg when
+    # search_path is set; union both views.
+    names |= set(inspector.get_table_names())
+    app_tables = set(Base.metadata.tables.keys())
+    return names & app_tables
 
 
 @pytest.fixture()

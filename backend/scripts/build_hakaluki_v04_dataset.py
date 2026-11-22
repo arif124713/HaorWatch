@@ -18,6 +18,14 @@ from shapely.geometry import shape as shp_shape
 
 from app.core.config import get_settings
 from app.core.exceptions import ProviderUnavailableError
+from app.ml.build_config import (
+    DEFAULT_LABEL_IGNORE_VALUE,
+    DEFAULT_PAIR_WINDOW_DAYS,
+    DEFAULT_REBUILD_STALE,
+    DEFAULT_S2_CLOUD_MAX,
+    DEFAULT_SAR_UNIT,
+    build_runtime_config,
+)
 from app.ml.dataset_cache import (
     BUILDER_VERSION,
     build_pair_record,
@@ -38,12 +46,10 @@ from app.ml.labels import IGNORE_LABEL, S2_NODATA_SENTINELS, apply_validity, bui
 
 AOI_PATH = Path(r"data\hakaluki_aoi.geojson")
 OUT = Path(r"data\hakaluki_v04_dataset")
-S2_CLOUD_MAX = 12
 
-# Reusable pair requires the full validity contract; a stale pair is rebuilt
-# only when --rebuild-stale is passed (we never silently overwrite). By default
-# stale pairs are skipped with a clear reason so no data is destroyed.
-REBUILD_STALE = False
+# Sentinel-2 export nodata sentinels that are finite but invalid. Any pixel equal
+# to one of these must NOT be treated as a valid non-water (0) label.
+S2_NODATA_SENTINELS = (-9999.0, -32768.0, -3.4028235e38)
 
 
 def _parse_args(argv=None):
@@ -53,7 +59,7 @@ def _parse_args(argv=None):
         help="Output dataset directory (default: the tracked v0.4 dataset dir).",
     )
     parser.add_argument(
-        "--rebuild-stale", action="store_true",
+        "--rebuild-stale", action="store_true", default=DEFAULT_REBUILD_STALE,
         help="Rebuild cached pairs that fail the cache-validity contract. Without this, "
              "stale pairs are reported and skipped (no data is destroyed).",
     )
@@ -61,19 +67,44 @@ def _parse_args(argv=None):
         "--version", default=None,
         help="Dataset version label to record in the manifest.",
     )
+    # Parameters wired from params.yaml / the DVC stage. Defaults preserve the
+    # historical standalone behaviour; DVC passes these explicitly.
+    parser.add_argument(
+        "--sar-unit", default=DEFAULT_SAR_UNIT, choices=["dB", "linear"],
+        help="Declared Sentinel-1 band unit (never inferred from pixel values).",
+    )
+    parser.add_argument(
+        "--s2-cloud-max", type=int, default=DEFAULT_S2_CLOUD_MAX,
+        help="Maximum Sentinel-2 CLOUDY_PIXEL_PERCENTAGE for pair selection.",
+    )
+    parser.add_argument(
+        "--pair-window-days", type=int, default=DEFAULT_PAIR_WINDOW_DAYS,
+        help="Maximum |S1 day - S2 day| in days for a same-day pair.",
+    )
+    parser.add_argument(
+        "--label-ignore-value", type=float, default=DEFAULT_LABEL_IGNORE_VALUE,
+        help="Value written for pixels excluded from supervision (must not be 0 or 1).",
+    )
     return parser.parse_args(argv)
-WINDOW_DAYS = 1
-# GEE COPERNICUS/S1_GRD VV/VH are dB backscatter. Declared explicitly; never guessed.
-SAR_UNIT = "dB"
-# Sentinel-2 export nodata sentinels that are finite but invalid. Any pixel equal
-# to one of these must NOT be treated as a valid non-water (0) label.
-S2_NODATA_SENTINELS = (-9999.0, -32768.0, -3.4028235e38)
-# Value written for pixels excluded from supervision (ignored by the loader).
-IGNORE_LABEL = -1.0
+
 
 _args = _parse_args()
 OUT = Path(_args.out_dir)
-REBUILD_STALE = bool(_args.rebuild_stale)
+# Validate the whole runtime configuration up front, before any GEE request or
+# output file creation. An invalid parameter fails loudly here.
+CONFIG = build_runtime_config(
+    sar_unit=_args.sar_unit,
+    s2_cloud_max=_args.s2_cloud_max,
+    pair_window_days=_args.pair_window_days,
+    label_ignore_value=_args.label_ignore_value,
+    rebuild_stale=_args.rebuild_stale,
+)
+SAR_UNIT = CONFIG.sar_unit
+S2_CLOUD_MAX = CONFIG.s2_cloud_max
+WINDOW_DAYS = CONFIG.pair_window_days
+IGNORE_LABEL = CONFIG.label_ignore_value
+REBUILD_STALE = CONFIG.rebuild_stale
+print(f"effective build configuration: {CONFIG.as_dict()}")
 
 settings = get_settings()
 client = GEEClient(settings.google_earth_engine_project)
@@ -170,7 +201,12 @@ def _sha256_file(path: Path) -> str | None:
 
 CODE_COMMIT = _code_commit()
 AOI_ID = hashlib.sha256(json.dumps(aoi_geojson, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-expected_grid = {"crs": utm_crs, "transform": list(grid_transform)[:6], "shape": list(grid_shape)}
+expected_grid = {
+    "crs": utm_crs,
+    "transform": list(grid_transform)[:6],
+    "shape": list(grid_shape),
+    "res": [abs(float(grid_transform.a)), abs(float(grid_transform.e))],
+}
 
 manifest = {
     "dataset_version": _args.version or "0.4.0",
@@ -178,6 +214,8 @@ manifest = {
     "code_commit": CODE_COMMIT,
     "sar_unit": SAR_UNIT,
     "aoi_id": AOI_ID,
+    # Effective runtime configuration actually used for this build (provenance).
+    "effective_config": CONFIG.as_dict(),
     "pairs": [],
     "grid": {"epsg": epsg, "transform": list(grid_transform)[:6], "shape": list(grid_shape)},
     "aoi_geojson": aoi_geojson,
@@ -348,7 +386,9 @@ for index, (s1_day, s2_day) in enumerate(pairs):
             "s1_grid": _sha256_file(pair_dir / "s1_grid.tif"),
             "pseudo_label": _sha256_file(pair_dir / "pseudo_label.tif"),
             "valid_mask": _sha256_file(pair_dir / "valid_mask.tif"),
+            "s1_valid_mask": _sha256_file(pair_dir / "s1_valid_mask.tif"),
         },
+        effective_config=CONFIG.as_dict(),
     ))
     print(f"pair {index:02d}: S1 {s1_day} ({s1_meta['image_count']} scenes) <-> S2 {s2_day}, water {water_px / max(int(pair_valid.sum()), 1) * 100:.1f}% (invalid {invalid_px})")
 

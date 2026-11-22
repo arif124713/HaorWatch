@@ -329,3 +329,174 @@ def test_register_bundle_updates_tracked_manifest(tmp_path, patched_manifest):
     entry = tracked["bundles"]["1.0.0"]
     assert entry["model_version"] == "1.0.0"
     assert entry["config_sha256"] == _sha256(dest / "config.json")
+
+
+# --------------------------------------------------------------------------- #
+# Malformed metadata must be a structured failure, never an exception
+# --------------------------------------------------------------------------- #
+
+def _setup(tmp_path, patched_manifest, *, config=None, stats=None):
+    """Write a synthetic bundle with explicit config/stats JSON objects."""
+    version = "9.9.9"
+    root = _make_root(tmp_path, version)
+    bundle = root / "unet" / version
+    _write_synthetic_bundle(bundle, version=version)
+    if config is not None:
+        (bundle / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    if stats is not None:
+        (bundle / "norm_stats.json").write_text(json.dumps(stats), encoding="utf-8")
+    patched_manifest.write_text(json.dumps(_manifest_for(bundle, version)), encoding="utf-8")
+    return root, bundle
+
+
+def _base_config(**overrides):
+    config = {
+        "model_version": "9.9.9",
+        "architecture": {"in_channels": 2, "out_channels": 1, "base_channels": 4},
+        "band_order": ["VV_dB", "VH_dB"],
+        "probability_threshold": 0.4,
+        "s1_unit": "dB",
+    }
+    config.update(overrides)
+    return config
+
+
+def _valid_stats(**overrides):
+    stats = {"mean": [0.0, 0.0], "std": [1.0, 1.0], "s1_unit": "dB"}
+    stats.update(overrides)
+    return stats
+
+
+@pytest.mark.parametrize("bad_threshold", ["invalid", None, "0.4", [0.4], {"v": 0.4}])
+def test_invalid_string_or_wrong_type_threshold_is_structured_failure(tmp_path, patched_manifest, bad_threshold):
+    root, _ = _setup(tmp_path, patched_manifest, config=_base_config(probability_threshold=bad_threshold))
+    report = verify_bundle("9.9.9", root)  # must not raise
+    assert report["ok"] is False
+    assert report["metadata"]["probability_threshold"]["match"] is False
+
+
+@pytest.mark.parametrize("bad_threshold", [float("nan"), float("inf"), -0.1, 1.5])
+def test_non_finite_or_out_of_range_threshold_is_structured_failure(tmp_path, patched_manifest, bad_threshold):
+    root, _ = _setup(tmp_path, patched_manifest, config=_base_config(probability_threshold=bad_threshold))
+    report = verify_bundle("9.9.9", root)
+    assert report["ok"] is False
+
+
+def test_wrong_band_order_type_is_structured_failure(tmp_path, patched_manifest):
+    root, _ = _setup(tmp_path, patched_manifest, config=_base_config(band_order={"a": 1}))
+    report = verify_bundle("9.9.9", root)
+    assert report["ok"] is False
+    assert report["metadata"]["band_order"]["match"] is False
+
+
+def test_empty_band_order_is_structured_failure(tmp_path, patched_manifest):
+    root, _ = _setup(tmp_path, patched_manifest, config=_base_config(band_order=[]))
+    report = verify_bundle("9.9.9", root)
+    assert report["ok"] is False
+
+
+def test_unknown_band_identifier_is_structured_failure(tmp_path, patched_manifest):
+    root, _ = _setup(tmp_path, patched_manifest, config=_base_config(band_order=["red", "green"]))
+    report = verify_bundle("9.9.9", root)
+    assert report["ok"] is False
+
+
+def test_missing_model_version_is_structured_failure(tmp_path, patched_manifest):
+    config = _base_config()
+    config.pop("model_version")
+    root, _ = _setup(tmp_path, patched_manifest, config=config)
+    report = verify_bundle("9.9.9", root)
+    assert report["ok"] is False
+    assert report["metadata"]["model_version"]["match"] is False
+
+
+def test_wrong_sar_unit_is_structured_failure(tmp_path, patched_manifest):
+    root, _ = _setup(tmp_path, patched_manifest, config=_base_config(s1_unit="bananas"))
+    report = verify_bundle("9.9.9", root)
+    assert report["ok"] is False
+
+
+def test_malformed_norm_stats_structure_is_structured_failure(tmp_path, patched_manifest):
+    root, _ = _setup(tmp_path, patched_manifest, stats={"mean": [0.0, 0.0], "std": [1.0], "s1_unit": "dB"})
+    report = verify_bundle("9.9.9", root)
+    assert report["ok"] is False
+    assert report["metadata"]["norm_stats_structure"]["match"] is False
+
+
+def test_non_finite_norm_stats_values_are_structured_failure(tmp_path, patched_manifest):
+    root, _ = _setup(tmp_path, patched_manifest, stats=_valid_stats(mean=[0.0, float("nan")]))
+    report = verify_bundle("9.9.9", root)
+    assert report["ok"] is False
+
+
+def test_zero_std_norm_stats_is_structured_failure(tmp_path, patched_manifest):
+    root, _ = _setup(tmp_path, patched_manifest, stats=_valid_stats(std=[0.0, 1.0]))
+    report = verify_bundle("9.9.9", root)
+    assert report["ok"] is False
+
+
+def test_config_not_a_json_object_is_structured_failure(tmp_path, patched_manifest):
+    version = "9.9.9"
+    root = _make_root(tmp_path, version)
+    bundle = root / "unet" / version
+    _write_synthetic_bundle(bundle, version=version)
+    (bundle / "config.json").write_text("[1, 2, 3]", encoding="utf-8")
+    patched_manifest.write_text(json.dumps(_manifest_for(bundle, version)), encoding="utf-8")
+    report = verify_bundle(version, root)
+    assert report["ok"] is False
+
+
+def test_corrupted_json_is_structured_failure(tmp_path, patched_manifest):
+    version = "9.9.9"
+    root = _make_root(tmp_path, version)
+    bundle = root / "unet" / version
+    _write_synthetic_bundle(bundle, version=version)
+    (bundle / "config.json").write_text("{not valid json", encoding="utf-8")
+    patched_manifest.write_text(json.dumps(_manifest_for(bundle, version)), encoding="utf-8")
+    report = verify_bundle(version, root)  # must not raise
+    assert report["ok"] is False
+
+
+def test_malformed_manifest_checksum_is_structured_failure(tmp_path, patched_manifest):
+    version = "9.9.9"
+    root = _make_root(tmp_path, version)
+    bundle = root / "unet" / version
+    _write_synthetic_bundle(bundle, version=version)
+    manifest = _manifest_for(bundle, version)
+    manifest["bundles"][version]["checkpoint_sha256"] = "not-a-sha"  # malformed
+    patched_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    report = verify_bundle(version, root)
+    assert report["ok"] is False
+    assert "malformed" in report["reason"]
+
+
+def test_manifest_not_json_object_is_structured_failure(tmp_path, patched_manifest):
+    patched_manifest.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    report = verify_bundle("9.9.9", tmp_path / "models")  # must not raise
+    assert report["ok"] is False
+
+
+def test_malformed_manifest_does_not_raise_and_verify_or_raise_is_fail_closed(tmp_path, patched_manifest):
+    version = "9.9.9"
+    root = _make_root(tmp_path, version)
+    bundle = root / "unet" / version
+    _write_synthetic_bundle(bundle, version=version)
+    manifest = _manifest_for(bundle, version)
+    manifest["bundles"][version]["probability_threshold"] = "invalid"
+    patched_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    # verify_bundle returns a structured failure; verify_or_raise converts it to
+    # a fail-closed error rather than crashing with a raw exception.
+    report = verify_bundle(version, root)
+    assert report["ok"] is False
+    with pytest.raises(BundleVerificationError):
+        verify_or_raise(version, root)
+
+
+def test_valid_synthetic_bundle_still_verifies(tmp_path, patched_manifest):
+    version = "9.9.9"
+    root = _make_root(tmp_path, version)
+    bundle = root / "unet" / version
+    _write_synthetic_bundle(bundle, version=version)
+    patched_manifest.write_text(json.dumps(_manifest_for(bundle, version)), encoding="utf-8")
+    report = verify_bundle(version, root)
+    assert report["ok"], report

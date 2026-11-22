@@ -142,3 +142,60 @@ def resolve_target() -> DbTarget:
     available = reachable(url)
     allowed, reason = classify(url)
     return DbTarget(url=url, name=database_name(url).lower(), available=available, allowed=allowed, reason=reason)
+
+
+# --------------------------------------------------------------------------- #
+# PostGIS / extension schema discovery
+# --------------------------------------------------------------------------- #
+def quote_ident(name: str) -> str:
+    """Safely quote a locally-generated schema identifier."""
+    if not name or not name.replace("_", "").isalnum():
+        raise ValueError(f"unsafe schema identifier: {name!r}")
+    return '"' + name + '"'
+
+
+def build_search_path(isolated_schema: str, extension_schemas: tuple[str, ...] = ()) -> str:
+    """Build a quoted ``search_path`` value.
+
+    Order: the unique isolated test schema first, then any extension schemas
+    (e.g. the schema PostGIS is installed into), then ``public`` last so the
+    isolated schema always wins for unqualified names. PostGIS is not assumed to
+    live in ``public``. Identifiers are quoted and de-duplicated.
+    """
+    parts: list[str] = []
+    for schema in (isolated_schema, *extension_schemas, "public"):
+        if not schema:
+            continue
+        if schema not in parts:
+            parts.append(schema)
+    return ", ".join(quote_ident(part) for part in parts)
+
+
+def discover_extension_schemas(engine, extensions: tuple[str, ...] = ("postgis",)) -> tuple[str, ...]:
+    """Query the database for the schema(s) each extension is installed into.
+
+    Returns the distinct extension schemas in a stable order. Falls back to
+    ``("public",)`` when the catalog query yields nothing, since that is the
+    PostgreSQL default for the PostGIS extension.
+    """
+    from sqlalchemy import text
+
+    found: list[str] = []
+    with engine.connect() as conn:
+        for extension in extensions:
+            try:
+                schema = conn.execute(
+                    text(
+                        "SELECT n.nspname FROM pg_extension e "
+                        "JOIN pg_namespace n ON n.oid = e.extnamespace "
+                        "WHERE e.extname = :name"
+                    ),
+                    {"name": extension},
+                ).scalar()
+            except Exception:  # noqa: BLE001 - catalog unavailable; fall back below
+                schema = None
+            if schema and schema not in found:
+                found.append(schema)
+    if not found:
+        return ("public",)
+    return tuple(found)
