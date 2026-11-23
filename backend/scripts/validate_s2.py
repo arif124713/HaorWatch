@@ -1,3 +1,4 @@
+import argparse
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -17,9 +18,18 @@ from app.ml.evaluate import classification_metrics, confusion_counts
 from app.models import AnalysisMetric
 from app.repositories.analysis import AnalysisRepository
 
-RUN_ID = "87078641-c08d-4d56-8762-00ad64349668"
-S2_DATE = "2026-09-19"
 S2_WINDOW_DAYS = 1
+
+parser = argparse.ArgumentParser(
+    description="Compare an analysis run against a Sentinel-2 MNDWI water proxy (NOT ground truth)."
+)
+parser.add_argument("--run-id", required=True, help="Analysis run UUID to attach proxy metrics to")
+parser.add_argument("--s2-date", required=True, help="Sentinel-2 reference date, ISO-8601 (YYYY-MM-DD)")
+parser.add_argument("--aoi", default=r"data\hakaluki_aoi.geojson", help="AOI GeoJSON used for the S2 reference")
+args = parser.parse_args()
+
+RUN_ID = args.run_id
+S2_DATE = args.s2_date
 
 run_dir = Path("data") / "runs" / RUN_ID
 flood_mask_path = run_dir / "flood_mask.tif"
@@ -31,7 +41,7 @@ with rasterio.open(flood_mask_path) as src:
     grid_shape = (src.height, src.width)
     grid_bounds = src.bounds
 
-aoi_geojson = json.load(open(r"data\hakaluki_aoi.geojson", encoding="utf-8"))["features"][0]["geometry"]
+aoi_geojson = json.load(open(args.aoi, encoding="utf-8"))["features"][0]["geometry"]
 
 settings = get_settings()
 client = GEEClient(settings.google_earth_engine_project)
@@ -140,12 +150,17 @@ otsu_metrics, otsu_counts = score("Otsu      ", otsu_mask)
 
 factory = get_session_factory()
 note = (
-    f"Proxy reference: Sentinel-2 MNDWI>0 water on {S2_DATE} (<=1 day from S1 acquisition). "
-    "Optical water misses flooded vegetation and differs from SAR flood semantics; treat as independent proxy, not ground truth."
+    "Validation category: optical satellite proxy comparison (NOT independent external reference "
+    "validation). Proxy reference: Sentinel-2 MNDWI>0 water on "
+    f"{S2_DATE} (<=1 day from S1 acquisition). Optical water misses flooded vegetation and differs "
+    "from SAR flood semantics; treat as an independent proxy, not ground truth. This does not "
+    "establish external validation."
 )
 with factory() as db:
     repo = AnalysisRepository(db)
-    run = repo.get(RUN_ID)
+    import uuid as _uuid
+
+    run = repo.get(_uuid.UUID(RUN_ID))
     if run is None:
         raise SystemExit("run not found")
     now = datetime.now(timezone.utc)
@@ -167,7 +182,10 @@ with factory() as db:
             true_negative=counts["true_negative"],
             false_negative=counts["false_negative"],
             test_pixel_count=int(overlap.sum()),
-            split_strategy="single-date Hakaluki AOI vs S2 MNDWI proxy",
+            split_strategy=(
+                f"single-date Hakaluki AOI {S2_DATE} vs S2 MNDWI proxy; "
+                "positive class = water; metrics = precision/recall/F1/IoU over matched valid pixels"
+            ),
             evaluated_at=now,
             notes=note,
         ))

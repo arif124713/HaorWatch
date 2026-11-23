@@ -37,6 +37,17 @@ def get_provenance_service(db: Session = Depends(get_db)) -> ProvenanceService:
     return ProvenanceService(db)
 
 
+def get_analysis_runner():
+    """Return the callable that executes a queued analysis in a subprocess.
+
+    Exposed as a dependency so tests and deployments can substitute a runner
+    without changing the endpoint.
+    """
+    from app.services.analysis_worker import execute_run_subprocess
+
+    return execute_run_subprocess
+
+
 def require_operator_key(
     x_operator_key: str | None = Header(default=None, alias="X-Operator-Key"),
     settings: Settings = Depends(get_settings_dep),

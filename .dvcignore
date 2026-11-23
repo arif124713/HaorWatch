@@ -1,0 +1,30 @@
+# Paths DVC must not traverse/scan. These are external, large, or environment
+# artifacts that are not part of the reproducible pipeline DAG.
+
+# Python virtual environments.
+venv/
+.venv/
+
+# Python caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Environment and secrets.
+.env
+backend/.env
+
+# Large/ignored data and model artifacts: tracked by path presence only, never
+# cached into a DVC remote by default (see `cache: false` in dvc.yaml).
+backend/data/runs/
+backend/models/
+*.tif
+*.tiff
+*.pt
+*.zip
+
+# Node/frontend.
+node_modules/
+
+# Git internals.
+.git/

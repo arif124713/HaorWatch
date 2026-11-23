@@ -10,6 +10,11 @@ from app.models import AnalysisLayer, AnalysisMetric, AnalysisRun, AnalysisSumma
 class AnalysisRepository:
     def __init__(self, db: Session):
         self.db = db
+        # Optional test-only synchronization hook. Called by ``report_of`` after
+        # the real lookup completes and before the result is returned. It is
+        # ``None`` in production and never changes lookup behaviour; tests inject
+        # a callable to coordinate racing callers at the repository boundary.
+        self.after_report_lookup = None
 
     def latest_for_study_area(self, study_area_id: uuid.UUID) -> AnalysisRun | None:
         return self.db.scalars(
@@ -54,18 +59,26 @@ class AnalysisRepository:
         return list(self.db.scalars(select(AnalysisMetric).where(AnalysisMetric.analysis_run_id == run_id)))
 
     def report_of(self, run_id: uuid.UUID, language: str) -> Report | None:
-        return self.db.scalars(
+        found = self.db.scalars(
             select(Report)
             .where(Report.analysis_run_id == run_id)
             .where(Report.language == language)
             .order_by(Report.created_at.desc())
         ).first()
+        hook = self.after_report_lookup
+        if hook is not None:
+            hook(found)
+        return found
 
     def save_report(self, report: Report) -> Report:
         self.db.add(report)
         self.db.commit()
         self.db.refresh(report)
         return report
+
+    def rollback(self) -> None:
+        """Roll back the current transaction so the session stays usable."""
+        self.db.rollback()
 
     def dataset_assets_for(self, study_area_id: uuid.UUID) -> list[DatasetAsset]:
         return list(

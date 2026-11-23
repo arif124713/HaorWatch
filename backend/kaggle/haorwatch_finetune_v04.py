@@ -98,7 +98,14 @@ class PairDataset(Dataset):
         with rasterio.open(pair_dir / "pseudo_label.tif") as src:
             label = src.read(1).astype(np.float32)
 
-        valid = np.isfinite(image).all(axis=0)
+        # Supervision validity = valid SAR ∧ valid label. Invalid Sentinel-2
+        # reference pixels are stored as the ignore sentinel (-1) in the label
+        # and must be excluded, never treated as non-water.
+        valid = np.isfinite(image).all(axis=0) & (label != -1)
+        valid_mask_path = pair_dir / "valid_mask.tif"
+        if valid_mask_path.exists():
+            with rasterio.open(valid_mask_path) as src:
+                valid = valid & (src.read(1) > 0.5)
         for band_index in range(image.shape[0]):
             band = image[band_index]
             if not looks_like_db(band):
@@ -271,9 +278,21 @@ def classification_metrics(counts):
 
 @torch.no_grad()
 def predict_full(model, pair_dir):
-    with rasterio.open(Path(pair_dir) / "s1_grid.tif") as src:
+    pair_dir = Path(pair_dir)
+    with rasterio.open(pair_dir / "s1_grid.tif") as src:
         image = src.read().astype(np.float32)
     valid = np.isfinite(image).all(axis=0)
+    # Consistency with training: apply the same validity mask (valid SAR ∧ valid
+    # Sentinel-2 reference) that PairDataset uses, so evaluation never scores
+    # pixels that training treated as invalid/ignored.
+    valid_mask_path = pair_dir / "valid_mask.tif"
+    if valid_mask_path.exists():
+        with rasterio.open(valid_mask_path) as src:
+            valid = valid & (src.read(1) > 0.5)
+    label_path = pair_dir / "pseudo_label.tif"
+    if label_path.exists():
+        with rasterio.open(label_path) as src:
+            valid = valid & (src.read(1) != -1)
     for band_index in range(2):
         band = image[band_index]
         band = (band - norm_stats["mean"][band_index]) / norm_stats["std"][band_index]

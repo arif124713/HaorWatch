@@ -1,0 +1,32 @@
+# Parameters referenced by dvc.yaml. Values mirror the tracked code defaults so
+# a parameter change is visible to DVC as a pipeline stage dependency.
+
+build:
+  sar_unit: dB              # GEE COPERNICUS/S1_GRD VV/VH are dB; declared, never guessed.
+  s2_cloud_max: 12          # Sentinel-2 CLOUDY_PIXEL_PERCENTAGE upper bound for pair selection.
+  pair_window_days: 1       # |S1 day - S2 day| allowed for a same-day pair.
+  label_ignore_value: -1.0  # Value written for pixels excluded from supervision.
+  rebuild_stale: false      # Rebuild cached pairs that fail the cache-validity contract.
+
+train:
+  seed: 42
+  batch_size: 16
+  epochs: 60
+  lr: 0.0003
+  weight_decay: 0.0001
+  patience: 8
+  base_channels: 32
+  loss: bce_tversky
+  s1_unit: dB
+  band_order:
+    - VV_dB
+    - VH_dB
+
+inference:
+  probability_threshold: 0.4  # Registered threshold for the default bundle (0.1.0).
+
+eval:
+  positive_class: flood
+  # Operator-tile results are positive-class agreement over positive-only
+  # annotations, never full-binary accuracy.
+  annotation_semantics: positive_only

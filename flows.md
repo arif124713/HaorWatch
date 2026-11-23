@@ -52,16 +52,16 @@ Success: user can explain model contribution and whether it improves over baseli
 
 ## 7. Optional operator analysis flow
 1. Operator submits configured study area and observation period through protected endpoint or CLI.
-2. Validate request and create queued/processing run.
-3. Resolve inputs and record provenance.
-4. Preprocess and align rasters.
-5. Apply permanent-water mask if configured.
-6. Run baseline and custom ML independently.
-7. Evaluate against held-out labels if available.
-8. Intersect flood and agricultural masks; calculate area.
+2. Validate request and create queued/processing run. A live-data run requires both observation dates; a prepared-data run requires an explicit `prepared_dir`. If the window is missing or invalid, the request is rejected (422) rather than left queued.
+3. Resolve inputs and record provenance, including observation semantics (single acquisition vs temporal composite, compositing method, image count, acquisition dates, orbit, polarisation, product IDs).
+4. Preprocess and align rasters to one authoritative analysis grid; validate CRS, transform, dimensions, and pixel alignment before pixel-wise work.
+5. Apply permanent-water mask if configured (occurrence threshold recorded).
+6. Run baseline and custom ML independently on the same grid/observation.
+7. Evaluate against held-out labels if available, distinguishing operator annotation, optical proxy, and independent external reference.
+8. Intersect flood and agricultural masks; calculate area excluding nodata.
 9. Persist layers, summary, metrics, provenance, report.
 10. Mark completed; on error mark failed with safe message.
-If end-to-end processing cannot be completed in MVP, load a prepared analysis bundle but clearly label it prepared/precomputed.
+A run is always executed by a subprocess worker; subprocess exit code, stdout/stderr, timeout, and launch status are recorded, and failures are visible via the API. If end-to-end processing cannot be completed in MVP, load a prepared analysis bundle but clearly label it prepared/precomputed.
 
 ## 8. Edge-case behavior
 

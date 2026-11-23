@@ -44,9 +44,9 @@ Use PostgreSQL 16 + PostGIS. Metadata, summaries, and vector geometries are stor
 - `baseline_method` varchar(80) nullable
 - `permanent_water_mask_applied` boolean default false
 - `permanent_water_threshold` numeric(6,3) nullable; record units/meaning in config
-- `validation_status` varchar(40): not_available/internal_test_only/external_reference_checked
+- `validation_status` varchar(40): not_available/internal_test_only/operator_annotated/operator_annotated_positive_only/proxy_validated/external_reference_checked
 - `validation_note` text nullable
-- `processing_config` JSONB required
+- `processing_config` JSONB required (includes `observation` block: type single/composite, compositing method, image count, acquisition dates, orbit, polarisation, product IDs, window)
 - `error_code` varchar(80), `error_message_safe` text nullable
 - `created_by` varchar(80) nullable (MVP system/operator label; no auth)
 
@@ -113,8 +113,9 @@ For every custom-model analysis run, persist or link to:
 - model family/name (`unet` for the MVP primary model), model version, checkpoint artifact reference;
 - dataset name/version/license note and label type (hand-labelled or weakly-labelled);
 - train/validation/test split manifest and event/geographic separation strategy;
-- input channel order, preprocessing and normalization parameters;
+- input channel order, preprocessing and normalization parameters (including the declared SAR band unit `s1_unit`: dB or linear);
 - training configuration, random seed, epoch/best-checkpoint metadata, and code version;
-- held-out evaluation metrics and evaluation sample count, when available.
+- held-out evaluation metrics and evaluation sample count, when available;
+- observation semantics (single vs temporal composite), compositing method, image count, acquisition dates, orbit, polarisation, and product/scene IDs.
 
 Do not store a claim of successful training without a real checkpoint and reproducible training record.

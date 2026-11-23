@@ -1,0 +1,213 @@
+# HaorWatch AI reproducible ML/data pipeline (DVC).
+#
+# This describes the real, reproducible stages of the backend/ML workstream.
+# It is intentionally explicit about which stages are DB-free (array/raster
+# processing) vs. PostGIS-backed (persistence), about external (non-DVC) inputs,
+# and about validation categories.
+#
+# Usage (from the repository root):
+#   dvc repro                      # run the default pipeline up to training data
+#   dvc repro prepare_training_data
+#   dvc repro train_unet           # requires Sen1Floods11 + a GPU/CPU host
+#   dvc repro hakaluki_diagnostics # requires a registered bundle
+#
+# Notes:
+# * Model weights and rasters are NOT stored in Git. Outputs are listed with
+#   `cache: false` where they must not be committed to a DVC cache in this repo
+#   because they are external/large or user data.
+# * Credentials (GEE, Copernicus) and the model artifact store are external and
+#   are NOT reproduced by DVC. See README "Deployment reproducibility".
+# * The Hakaluki operator labels are positive-only; diagnostics report
+#   positive-class agreement, never full-binary accuracy.
+
+vars:
+  - params.yaml
+
+stages:
+
+  # ------------------------------------------------------------------------- #
+  # 1. Reproducibility metadata for tracked model bundles (no weights needed). #
+  # ------------------------------------------------------------------------- #
+  verify_model_manifest:
+    desc: >-
+      Verify the tracked model-bundle manifest is well-formed and, when bundles
+      are present on disk, that their checksums and metadata (model version,
+      SAR unit, band order, probability threshold) match. Fails closed.
+    cmd: python -m pytest -q backend/tests/unit/test_bundle_metadata.py
+    deps:
+      - backend/app/ml/bundles_manifest.json
+      - backend/app/ml/model_registry.py
+      - backend/app/ml/inference.py
+      - backend/tests/unit/test_bundle_metadata.py
+    outs:
+      - backend/models/.gitkeep:
+          cache: false
+
+  # ------------------------------------------------------------------------- #
+  # 2. Unit test gate (DB-free): validity, reprojection, bundle, dataset.      #
+  # ------------------------------------------------------------------------- #
+  unit_tests:
+    desc: Run the DB-free unit suite (label validity, reprojection validity, dataset cache, bundle metadata, metrics).
+    cmd: python -m pytest -q backend/tests/unit
+    deps:
+      - backend/app
+      - backend/tests/unit
+
+  # ------------------------------------------------------------------------- #
+  # 3. Sen1Floods11 dataset download + audit (external, gsutil required).      #
+  # ------------------------------------------------------------------------- #
+  prepare_data:
+    desc: >-
+      Download the Sen1Floods11 v1.1 subsets (external, requires gsutil and
+      dataset access terms) and write an audit file. Skipped by DVC if the
+      audit output already exists and deps are unchanged.
+    cmd: python backend/scripts/prepare_data.py --download --out backend/data/sen1floods11 --audit
+    deps:
+      - backend/scripts/prepare_data.py
+    outs:
+      - backend/data/sen1floods11:
+          cache: false
+
+  # ------------------------------------------------------------------------- #
+  # 4. Hakaluki AOI (external GEE/geometry; tracked GeoJSON when committed).   #
+  # ------------------------------------------------------------------------- #
+  hakaluki_aoi:
+    desc: Fetch/confirm the pilot Hakaluki AOI geometry used by the dataset build.
+    cmd: python backend/scripts/fetch_hakaluki_aoi.py
+    deps:
+      - backend/scripts/fetch_hakaluki_aoi.py
+    outs:
+      - backend/data/hakaluki_aoi.geojson:
+          cache: false
+
+  # ------------------------------------------------------------------------- #
+  # 5. Build the Hakaluki v0.4 S1/S2 pseudo-label dataset (GEE required).      #
+  #    Enforces the cache-validity contract: a cached pair is reused only when #
+  #    it contains ALL FOUR required artifacts (s1_grid.tif, pseudo_label.tif,  #
+  #    valid_mask.tif, s1_valid_mask.tif) AND its metadata matches the expected #
+  #    grid (CRS/transform/shape/resolution), SAR unit, ignore value, source    #
+  #    dates, and builder version.                                              #
+  #                                                                             #
+  #    The command is a single stable wrapper (dvc_build_dataset.py). The       #
+  #    wrapper reads and validates params.yaml through build_config and forwards  #
+  #    every parameter explicitly, so a params.yaml change changes runtime       #
+  #    behaviour without relying on DVC-specific per-parameter command           #
+  #    templating (which is version/platform-sensitive for boolean flags).        #
+  #    All five parameters remain DVC stage dependencies.                        #
+  # ------------------------------------------------------------------------- #
+  build_hakaluki_v04_dataset:
+    desc: >-
+      Build S1/S2 same-day pairs with Sentinel-2 MNDWI>0 pseudo-labels, explicit
+      validity masks, nodata-preserving reprojection, and a per-pair metadata
+      contract. Requires Google Earth Engine credentials.
+    cmd: python backend/scripts/dvc_build_dataset.py
+    deps:
+      - backend/scripts/dvc_build_dataset.py
+      - backend/scripts/build_hakaluki_v04_dataset.py
+      - backend/app/ml/build_config.py
+      - backend/app/ml/dataset_cache.py
+      - backend/app/ml/labels.py
+      - backend/app/geospatial/reprojection.py
+      - backend/data/hakaluki_aoi.geojson
+    params:
+      - params.yaml:
+          - build.sar_unit
+          - build.s2_cloud_max
+          - build.pair_window_days
+          - build.label_ignore_value
+          - build.rebuild_stale
+    outs:
+      - backend/data/hakaluki_v04_dataset:
+          cache: false
+
+  # ------------------------------------------------------------------------- #
+  # 6. Train the Sen1Floods11 U-Net (GPU recommended; long-running).           #
+  # ------------------------------------------------------------------------- #
+  train_unet:
+    desc: Train the base U-Net (v0.1.0) on Sen1Floods11 hand labels and write config/norm_stats/metrics.
+    cmd: >-
+      python backend/scripts/train_model.py
+      --data-dir backend/data/sen1floods11
+      --out-dir backend/models/kaggle-output/haorwatch_unet_v0.1.0
+      --s1-unit dB
+    deps:
+      - backend/app/ml/train.py
+      - backend/app/ml/dataset.py
+      - backend/app/ml/features.py
+      - backend/app/ml/evaluate.py
+      - backend/scripts/train_model.py
+      - backend/data/sen1floods11
+    params:
+      - train.seed
+      - train.batch_size
+      - train.epochs
+      - train.lr
+      - train.base_channels
+      - train.s1_unit
+    outs:
+      - backend/models/kaggle-output/haorwatch_unet_v0.1.0:
+          cache: false
+
+  # ------------------------------------------------------------------------- #
+  # 7. Register a produced bundle into the tracked registry (no weight copies  #
+  #    to Git; copies into the gitignored models/unet/<version> tree and       #
+  #    updates bundles_manifest.json).                                         #
+  # ------------------------------------------------------------------------- #
+  register_bundle:
+    desc: >-
+      Register a complete bundle (checkpoint.pt + config.json + norm_stats.json)
+      into models/unet/<version> and update the tracked manifest. Refuses to
+      register an incomplete bundle.
+    cmd: >-
+      python backend/scripts/train_model.py
+      --register backend/models/kaggle-output/haorwatch_unet_v0.1.0
+      --model-root backend/models
+    deps:
+      - backend/scripts/train_model.py
+      - backend/app/ml/model_registry.py
+      - backend/models/kaggle-output/haorwatch_unet_v0.1.0
+    outs:
+      - backend/app/ml/bundles_manifest.json
+
+  # ------------------------------------------------------------------------- #
+  # 8. Hakaluki operator-tile diagnostics (positive-only; not accuracy).       #
+  # ------------------------------------------------------------------------- #
+  hakaluki_diagnostics:
+    desc: >-
+      Produce probability histograms, water fractions over valid pixels,
+      U-Net/Otsu/operator overlays, a difference map, validity masks, per-tile
+      positive-class agreement, and a tile-overlap check for the two operator
+      tiles. Requires the operator tiles and a registered bundle.
+    cmd: >-
+      python backend/scripts/hakaluki_diagnostics.py
+      --bundle backend/models/unet/0.4.0
+      --out backend/data/hakaluki_diagnostics
+    deps:
+      - backend/scripts/hakaluki_diagnostics.py
+      - backend/app/ml/inference.py
+      - backend/app/ml/baseline.py
+      - backend/app/ml/evaluate.py
+      - backend/data/hakaluki_labelkit
+      - backend/data/hakaluki_labels
+      - backend/models/unet/0.4.0
+    outs:
+      - backend/data/hakaluki_diagnostics:
+          cache: false
+
+  # ------------------------------------------------------------------------- #
+  # 9. PostGIS-backed integration gate (migrations + persistence).             #
+  #    Requires a reachable, recognisably test PostgreSQL; refuses production- #
+  #    like database names. Skipped at the pytest level when no DB is present. #
+  # ------------------------------------------------------------------------- #
+  db_integration_tests:
+    desc: >-
+      Run isolated-schema integration tests against PostgreSQL (unique
+      constraint, ORM ReportService concurrency, PostGIS migration). Requires
+      HAORWATCH_TEST_DATABASE_URL pointing at a test database.
+    cmd: python -m pytest -q backend/tests/integration
+    deps:
+      - backend/app/models
+      - backend/app/repositories
+      - backend/app/services/report_service.py
+      - backend/tests/integration
+      - backend/alembic
