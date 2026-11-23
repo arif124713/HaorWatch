@@ -10,8 +10,13 @@ trusted.
 Builder semantics encoded here (do not invent new meanings):
 
 * ``s1_valid_mask.tif`` — valid SAR observations: AOI ∧ finite/sentinel-free SAR
-  (the builder's ``valid`` mask). ``s1_grid.tif`` is the SAR grid with invalid
-  pixels set to non-finite (NaN) and nodded.
+  over **all** bands (the builder's ``valid`` mask). ``s1_grid.tif`` is a
+  two-band (VV, VH) float32 SAR grid written with a single shared
+  ``nodata=NaN``; the builder sets **every** band to NaN wherever SAR is
+  invalid. The validator therefore checks each SAR band independently against
+  ``s1_valid_mask.tif``; a clean VV band must not excuse invalid VH data. A
+  finite declared nodata sentinel is also accepted, but a plausibly valid
+  backscatter value on an invalid pixel is rejected.
 * ``valid_mask.tif`` — valid supervision region: AOI ∧ valid SAR ∧ valid
   Sentinel-2 reference (the builder's ``pair_valid``). This is a subset of
   ``s1_valid_mask.tif``. The manifest ``valid_px`` field is defined as the count
@@ -174,29 +179,90 @@ def _res_close(got, expected, tol: float = _RES_TOL) -> bool:
     return all(_close(a, b, tol=tol) for a, b in zip(got, expected))
 
 
+def _is_positive_int(value) -> bool:
+    """True only for a genuine positive integer (not a bool, not fractional)."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, float):
+        return math.isfinite(value) and value.is_integer() and value > 0
+    return False
+
+
+def _finite_float(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _validate_expected_grid(expected_grid: dict, reasons: list[str]) -> bool:
-    """Validate that the expected grid carries the fields needed for reuse.
+    """Validate that the expected grid carries usable, well-formed metadata.
 
     Returns True when the expected grid is usable. Missing/malformed expected
     fields are a cache failure (we cannot prove safety), not a silent skip.
+
+    Checks: shape is exactly two positive integers (bools and fractional values
+    are rejected, not truncated); transform has six finite coefficients; the
+    resolution (when present) has two finite, strictly positive values; and the
+    CRS is present and parseable.
     """
+    if not isinstance(expected_grid, dict):
+        reasons.append(f"expected grid is not an object: {type(expected_grid).__name__}")
+        return False
+
     ok = True
+
+    # CRS: present and parseable.
     crs = expected_grid.get("crs")
-    if not crs:
-        reasons.append("expected grid is missing 'crs'")
+    if not crs or not isinstance(crs, str):
+        reasons.append("expected grid is missing a usable 'crs'")
         ok = False
-    transform = expected_grid.get("transform")
-    if not isinstance(transform, (list, tuple)) or len(transform) != 6:
-        reasons.append("expected grid transform must be a 6-element sequence")
-        ok = False
+    else:
+        try:
+            from pyproj import CRS
+
+            CRS.from_user_input(crs)
+        except Exception:  # noqa: BLE001 - any parse failure is a grid failure
+            reasons.append(f"expected grid 'crs' is not parseable: {crs!r}")
+            ok = False
+
+    # Shape: two positive integers.
     shape = expected_grid.get("shape")
     if not isinstance(shape, (list, tuple)) or len(shape) != 2:
         reasons.append("expected grid shape must be a 2-element sequence")
         ok = False
-    res = expected_grid.get("res")
-    if res is not None and (not isinstance(res, (list, tuple)) or len(res) != 2):
-        reasons.append("expected grid resolution must be a 2-element sequence")
+    elif not all(_is_positive_int(dim) for dim in shape):
+        reasons.append(f"expected grid shape dimensions must be positive integers: {list(shape)!r}")
         ok = False
+
+    # Transform: six finite coefficients.
+    transform = expected_grid.get("transform")
+    if not isinstance(transform, (list, tuple)) or len(transform) != 6:
+        reasons.append("expected grid transform must be a 6-element sequence")
+        ok = False
+    elif not all(_finite_float(coef) is not None for coef in transform):
+        reasons.append(f"expected grid transform coefficients must be finite: {list(transform)!r}")
+        ok = False
+
+    # Resolution (optional): two finite, strictly positive values.
+    res = expected_grid.get("res")
+    if res is not None:
+        if not isinstance(res, (list, tuple)) or len(res) != 2:
+            reasons.append("expected grid resolution must be a 2-element sequence")
+            ok = False
+        else:
+            res_values = [_finite_float(v) for v in res]
+            if any(v is None or v <= 0.0 for v in res_values):
+                reasons.append(
+                    f"expected grid resolution must be finite and strictly positive: {list(res)!r}"
+                )
+                ok = False
+
     return ok
 
 
@@ -228,19 +294,33 @@ def _validate_raster_against_grid(name: str, meta: dict, expected_grid: dict, re
 
 
 def _mask_is_binary(path: Path, *, reasons: list[str]) -> bool:
-    """Windowed scan: return True iff band 1 contains only {0, 1} (ignoring nodata)."""
+    """Windowed scan: return True iff band 1 holds only binary ``{0, 1}`` values.
+
+    NaN and +/-Inf are **rejected** explicitly, not filtered away: a non-finite
+    mask value is invalid and must not be silently treated as zero (or as a
+    valid pixel). Values equal to a declared finite nodata sentinel are permitted
+    (the builder declares ``nodata=0.0`` for masks, which is a real class, so a
+    finite nodata is *not* excused here unless it is that declared sentinel).
+    """
     meta = _read_raster_meta(path)
     nodata = meta.get("nodata") if meta else None
     try:
         for _window, values in _iter_windows(path):
-            finite = values[np.isfinite(values)]
-            if nodata is not None and math.isfinite(float(nodata)):
-                finite = finite[~np.isclose(finite, float(nodata), atol=_BINARY_TOL)]
-            if finite.size == 0:
+            if values.size == 0:
                 continue
-            bad = finite[~((np.abs(finite) <= _BINARY_TOL) | (np.abs(finite - 1.0) <= _BINARY_TOL))]
-            if bad.size:
-                reasons.append(f"{path.name} has non-binary mask values (e.g. {float(bad[0])!r})")
+            # 1. Reject NaN / +Inf / -Inf outright.
+            finite = np.isfinite(values)
+            if not finite.all():
+                reasons.append(f"{path.name} contains a non-finite (NaN/Inf) mask value")
+                return False
+            # 2. Every finite value must be a binary class (or the declared
+            #    finite nodata sentinel, if any).
+            binary = (np.abs(values) <= _BINARY_TOL) | (np.abs(values - 1.0) <= _BINARY_TOL)
+            if nodata is not None and math.isfinite(float(nodata)):
+                binary |= np.isclose(values, float(nodata), atol=_BINARY_TOL)
+            if not binary.all():
+                example = float(values[~binary][0])
+                reasons.append(f"{path.name} has non-binary mask values (e.g. {example!r})")
                 return False
     except _RasterUnreadable as exc:
         reasons.append(f"{path.name} unreadable: {exc}")
@@ -249,7 +329,11 @@ def _mask_is_binary(path: Path, *, reasons: list[str]) -> bool:
 
 
 def _iter_window_arrays(paths: list[Path]):
-    """Yield aligned (window, {name: array}) blocks for several same-grid rasters."""
+    """Yield aligned (window, {name: (bands, rows, cols) float64}) blocks.
+
+    Every band of every raster is read for each window (bounded memory), so a
+    multi-band SAR grid is validated band-by-band rather than only band 1.
+    """
     import rasterio
 
     handles = {}
@@ -268,7 +352,7 @@ def _iter_window_arrays(paths: list[Path]):
                 window = Window(col_off, row_off, cols, rows)
                 block_arrays = {}
                 for path in paths:
-                    block_arrays[path.name] = handles[path.name].read(1, window=window).astype("float64")
+                    block_arrays[path.name] = handles[path.name].read(window=window).astype("float64")
                 yield window, block_arrays
     except _RasterUnreadable:
         raise
@@ -321,15 +405,17 @@ def _validate_pixel_semantics(
     supervision_subset_ok = True
     label_ignore_ok = True
     label_class_ok = True
-    sar_invalid_ok = True
-    sar_valid_finite_ok = True
+    # Per-band SAR flags: a defect in band 2 must not be masked by a clean band 1.
+    sar_invalid_ok: dict[int, bool] = {}
+    sar_valid_finite_ok: dict[int, bool] = {}
 
     try:
         for _window, arrays in _iter_window_arrays([valid_mask, s1_valid_mask, label, s1_grid]):
-            vm = arrays[valid_mask.name] > 0.5
-            s1m = arrays[s1_valid_mask.name] > 0.5
-            lab = arrays[label.name]
-            sar = arrays[s1_grid.name]
+            # Masks and label are single-band; SAR is multi-band.
+            vm = arrays[valid_mask.name][0] > 0.5
+            s1m = arrays[s1_valid_mask.name][0] > 0.5
+            lab = arrays[label.name][0]
+            sar_stack = arrays[s1_grid.name]  # (bands, rows, cols)
 
             valid_px += int(vm.sum())
             invalid_px += int((~vm).sum())
@@ -353,8 +439,7 @@ def _validate_pixel_semantics(
 
             # Label class consistency: valid supervision => only {0, 1}.
             if label_class_ok:
-                valid_supervision = vm
-                lv = lab[valid_supervision]
+                lv = lab[vm]
                 if lv.size:
                     bad = lv[~((np.abs(lv) <= _BINARY_TOL) | (np.abs(lv - 1.0) <= _BINARY_TOL))]
                     if bad.size:
@@ -363,24 +448,40 @@ def _validate_pixel_semantics(
                         )
                         label_class_ok = False
 
-            # SAR invalid pixels must be represented non-finite (builder convention).
-            if sar_invalid_ok:
-                invalid_sar = ~s1m
-                if np.any(invalid_sar & np.isfinite(sar)):
-                    reasons.append(
-                        f"{_SAR_GRID_ARTIFACT} has finite values where {_S1_VALID_MASK_ARTIFACT} is 0 "
-                        "(invalid SAR must be non-finite)"
-                    )
-                    sar_invalid_ok = False
+            # Validate EVERY SAR band against the SAR validity mask.
+            for band_index in range(sar_stack.shape[0]):
+                band = sar_stack[band_index]
+                band_no = band_index + 1  # 1-based for messages
 
-            # SAR valid pixels must be finite (never silently nodata/non-finite).
-            if sar_valid_finite_ok:
-                valid_sar = s1m
-                if np.any(valid_sar & ~np.isfinite(sar)):
-                    reasons.append(
-                        f"{_SAR_GRID_ARTIFACT} has non-finite values where {_S1_VALID_MASK_ARTIFACT} is 1"
-                    )
-                    sar_valid_finite_ok = False
+                # Invalid SAR pixels must be represented either non-finite (NaN)
+                # or at the declared nodata sentinel — never as a plausibly valid
+                # backscatter value. The builder's documented convention is
+                # `nodata=NaN` shared across both bands, but a finite declared
+                # sentinel is also accepted so the validator matches the actual
+                # builder contract rather than inventing one.
+                invalid_mask = ~s1m
+                if sar_invalid_ok.get(band_index, True) and np.any(invalid_mask):
+                    invalid_values = band[invalid_mask]
+                    represented = ~np.isfinite(invalid_values)
+                    if s1_nodata is not None:
+                        represented |= np.isclose(
+                            invalid_values, float(s1_nodata), atol=_BINARY_TOL, equal_nan=True
+                        )
+                    if not represented.all():
+                        reasons.append(
+                            f"{_SAR_GRID_ARTIFACT} band {band_no} has a plausible value where "
+                            f"{_S1_VALID_MASK_ARTIFACT} is 0 (invalid SAR must be nodata/non-finite)"
+                        )
+                        sar_invalid_ok[band_index] = False
+
+                # Valid SAR pixels must be finite (never silently nodata/non-finite).
+                if sar_valid_finite_ok.get(band_index, True):
+                    if np.any(s1m & ~np.isfinite(band)):
+                        reasons.append(
+                            f"{_SAR_GRID_ARTIFACT} band {band_no} has non-finite values where "
+                            f"{_S1_VALID_MASK_ARTIFACT} is 1"
+                        )
+                        sar_valid_finite_ok[band_index] = False
     except _RasterUnreadable as exc:
         reasons.append(f"pixel-semantics scan failed: {exc}")
         return 0, 0

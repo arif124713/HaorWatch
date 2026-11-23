@@ -246,7 +246,7 @@ def test_missing_expected_crs_is_stale(tmp_path):
         expected_ignore_value=IGNORE, record=_good_record(pair),
     )
     assert not decision.reusable
-    assert any("missing 'crs'" in r for r in decision.stale_reasons)
+    assert any("crs" in r for r in decision.stale_reasons)
 
 
 def test_inter_raster_grid_mismatch_is_stale(tmp_path):
@@ -297,7 +297,7 @@ def test_sar_invalid_inconsistent_with_s1_valid_mask_is_stale(tmp_path):
     _make_pair(pair, s1_values=bad_sar)
     decision = _evaluate(pair, _good_record(pair))
     assert not decision.reusable
-    assert any("finite values where" in r for r in decision.stale_reasons)
+    assert any("plausible value where" in r for r in decision.stale_reasons)
 
 
 def test_non_finite_valid_sar_pixels_is_stale(tmp_path):
@@ -541,3 +541,283 @@ def test_load_manifest_corrupt_json_returns_empty(tmp_path):
 def test_pair_record_for_malformed_manifest_is_none(tmp_path):
     assert pair_record_for({"pairs": "notalist"}, tmp_path) is None
     assert pair_record_for([], tmp_path) is None
+
+
+# =========================================================================== #
+# §1 Per-SAR-band validation (VV and VH must each be checked)
+# =========================================================================== #
+
+def _write_pair_two_band(pair, vv, vh, *, valid_mask=None, s1_valid_mask=None,
+                         label=None, nodata=np.nan):
+    """Write a pair with explicit VV/VH bands and masks for per-band tests."""
+    pair.mkdir(parents=True, exist_ok=True)
+    s1m = S1_VALID if s1_valid_mask is None else s1_valid_mask
+    vm = VALID if valid_mask is None else valid_mask
+    if label is None:
+        label = np.where(vm > 0.5, 1.0, IGNORE).astype("float32")
+    _write(pair / "s1_grid.tif", np.stack([vv.astype("float32"), vh.astype("float32")]),
+           nodata=nodata, count=2)
+    _write(pair / "pseudo_label.tif", label, nodata=IGNORE, count=1)
+    _write(pair / "valid_mask.tif", vm, nodata=0.0, count=1)
+    _write(pair / "s1_valid_mask.tif", s1m, nodata=0.0, count=1)
+
+
+def test_valid_two_band_sar_passes(tmp_path):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)  # both bands valid
+    decision = _evaluate(pair, _good_record(pair))
+    assert decision.reusable, decision.stale_reasons
+
+
+def test_invalid_value_in_sar_band1_is_rejected(tmp_path):
+    """Band 1 (VV) has a plausible value where SAR is invalid; band 2 is clean."""
+    pair = tmp_path / "pair_00"
+    vv = np.where(S1_VALID > 0.5, -12.0, np.nan).astype("float32")
+    vh = np.where(S1_VALID > 0.5, -18.0, np.nan).astype("float32")
+    # Corrupt band 1 only: finite value on an invalid pixel.
+    vv[7, 3] = -12.0
+    _write_pair_two_band(pair, vv, vh)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    assert any("band 1" in r for r in decision.stale_reasons)
+
+
+def test_invalid_value_in_sar_band2_is_rejected(tmp_path):
+    """Band 1 (VV) is clean but band 2 (VH) has an invalid pixel — must be caught."""
+    pair = tmp_path / "pair_00"
+    vv = np.where(S1_VALID > 0.5, -12.0, np.nan).astype("float32")
+    vh = np.where(S1_VALID > 0.5, -18.0, np.nan).astype("float32")
+    # Corrupt band 2 only.
+    vh[7, 5] = -18.0
+    _write_pair_two_band(pair, vv, vh)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    assert any("band 2" in r for r in decision.stale_reasons)
+
+
+def test_non_finite_valid_pixel_in_band2_is_rejected(tmp_path):
+    """Band 2 has NaN where SAR is valid (band 1 is clean)."""
+    pair = tmp_path / "pair_00"
+    vv = np.where(S1_VALID > 0.5, -12.0, np.nan).astype("float32")
+    vh = np.where(S1_VALID > 0.5, -18.0, np.nan).astype("float32")
+    vh[2, 2] = np.nan  # valid pixel, but band 2 missing
+    _write_pair_two_band(pair, vv, vh)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    assert any("band 2" in r for r in decision.stale_reasons)
+
+
+def test_corrupt_pixel_in_later_window_is_detected(tmp_path):
+    """A band-2 defect far beyond the first processing window must be detected."""
+    pair = tmp_path / "pair_00"
+    size = 1400  # forces >1 window at the bounded block size
+    grid = dict(GRID, shape=[size, size], res=[10.0, 10.0])
+    vv = np.full((size, size), -12.0, dtype="float32")
+    vh = np.full((size, size), -18.0, dtype="float32")
+    s1m = np.ones((size, size), dtype="float32")
+    valid = np.ones((size, size), dtype="float32")
+    label = np.ones((size, size), dtype="float32")
+    # Inject a single wrong-band-2 value at a valid pixel at (1300, 1300).
+    vh[1300, 1300] = np.nan
+    _write(pair / "s1_grid.tif", np.stack([vv, vh]), nodata=np.nan, count=2)
+    _write(pair / "pseudo_label.tif", label, nodata=IGNORE)
+    _write(pair / "valid_mask.tif", valid, nodata=0.0)
+    _write(pair / "s1_valid_mask.tif", s1m, nodata=0.0)
+    record = build_pair_record(
+        pair_dir=pair, sar_unit="dB", s1_day="2026-06-07", s2_day="2026-06-07",
+        s1_meta={"image_count": 1}, aoi_id="abc", grid=grid, label_ignore_value=IGNORE,
+        nodata={}, valid_px=size * size, invalid_px=0, water_px=size * size,
+    )
+    decision = evaluate_pair_cache(
+        pair, expected_grid=grid, expected_sar_unit="dB",
+        expected_ignore_value=IGNORE, record=record,
+    )
+    assert not decision.reusable
+    assert any("band 2" in r for r in decision.stale_reasons)
+
+
+# =========================================================================== #
+# §2 NaN / Inf in binary masks must be rejected, not silently ignored
+# =========================================================================== #
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, -np.inf])
+def test_nan_or_inf_in_valid_mask_is_stale(tmp_path, bad_value):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    bad = VALID.copy()
+    bad[3, 3] = bad_value
+    _write(pair / "valid_mask.tif", bad, nodata=0.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    assert any("valid_mask.tif" in r and "non-finite" in r for r in decision.stale_reasons)
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, -np.inf])
+def test_nan_or_inf_in_s1_valid_mask_is_stale(tmp_path, bad_value):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    bad = S1_VALID.copy()
+    bad[4, 4] = bad_value
+    _write(pair / "s1_valid_mask.tif", bad, nodata=0.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    assert any("s1_valid_mask.tif" in r and "non-finite" in r for r in decision.stale_reasons)
+
+
+def test_nan_mask_value_beyond_first_window_is_detected(tmp_path):
+    pair = tmp_path / "pair_00"
+    size = 1400
+    grid = dict(GRID, shape=[size, size], res=[10.0, 10.0])
+    vv = np.full((size, size), -12.0, dtype="float32")
+    vh = np.full((size, size), -18.0, dtype="float32")
+    mask = np.ones((size, size), dtype="float32")
+    mask[1300, 1300] = np.nan  # far beyond the first window
+    label = np.ones((size, size), dtype="float32")
+    _write(pair / "s1_grid.tif", np.stack([vv, vh]), nodata=np.nan, count=2)
+    _write(pair / "pseudo_label.tif", label, nodata=IGNORE)
+    _write(pair / "valid_mask.tif", mask, nodata=0.0)
+    _write(pair / "s1_valid_mask.tif", mask, nodata=0.0)
+    record = build_pair_record(
+        pair_dir=pair, sar_unit="dB", s1_day="2026-06-07", s2_day="2026-06-07",
+        s1_meta={"image_count": 1}, aoi_id="abc", grid=grid, label_ignore_value=IGNORE,
+        nodata={}, valid_px=size * size, invalid_px=0, water_px=size * size,
+    )
+    decision = evaluate_pair_cache(
+        pair, expected_grid=grid, expected_sar_unit="dB",
+        expected_ignore_value=IGNORE, record=record,
+    )
+    assert not decision.reusable
+    assert any("non-finite" in r for r in decision.stale_reasons)
+
+
+def test_valid_binary_masks_still_pass(tmp_path):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    decision = _evaluate(pair, _good_record(pair))
+    assert decision.reusable, decision.stale_reasons
+
+
+# =========================================================================== #
+# §3 Expected-grid metadata validation
+# =========================================================================== #
+
+def _eval_with_grid(pair, grid):
+    return evaluate_pair_cache(
+        pair, expected_grid=grid, expected_sar_unit="dB",
+        expected_ignore_value=IGNORE, record=_good_record(pair),
+    )
+
+
+def test_malformed_shape_wrong_length_is_stale(tmp_path):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    decision = _eval_with_grid(pair, dict(GRID, shape=[8]))
+    assert not decision.reusable
+    assert any("shape" in r for r in decision.stale_reasons)
+
+
+@pytest.mark.parametrize("bad_shape", [[8.5, 8], [8, 8.0001], [0, 8], [-1, 8], [8, 0]])
+def test_fractional_or_non_positive_shape_is_stale(tmp_path, bad_shape):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    decision = _eval_with_grid(pair, dict(GRID, shape=bad_shape))
+    assert not decision.reusable
+    assert any("positive integers" in r for r in decision.stale_reasons)
+
+
+@pytest.mark.parametrize("bad_shape", [[True, 8], [8, False]])
+def test_boolean_shape_dimension_is_stale(tmp_path, bad_shape):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    decision = _eval_with_grid(pair, dict(GRID, shape=bad_shape))
+    assert not decision.reusable
+    assert any("positive integers" in r for r in decision.stale_reasons)
+
+
+@pytest.mark.parametrize("bad_transform", [
+    [10.0, 0.0, 0.0, 0.0, -10.0],              # too few
+    [10.0, 0.0, 0.0, 0.0, -10.0, 0.0, 1.0],    # too many
+    [np.nan, 0.0, 0.0, 0.0, -10.0, 0.0],       # NaN coefficient
+    [np.inf, 0.0, 0.0, 0.0, -10.0, 0.0],       # Inf coefficient
+])
+def test_malformed_transform_is_stale(tmp_path, bad_transform):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    decision = _eval_with_grid(pair, dict(GRID, transform=bad_transform))
+    assert not decision.reusable
+    assert any("transform" in r for r in decision.stale_reasons)
+
+
+@pytest.mark.parametrize("bad_res", [[10.0], [10.0, 10.0, 10.0], [0.0, 10.0], [-10.0, 10.0],
+                                     [np.nan, 10.0], [np.inf, 10.0]])
+def test_invalid_resolution_is_stale(tmp_path, bad_res):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    decision = _eval_with_grid(pair, dict(GRID, res=bad_res))
+    assert not decision.reusable
+    assert any("resolution" in r for r in decision.stale_reasons)
+
+
+def test_malformed_crs_is_stale(tmp_path):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    decision = _eval_with_grid(pair, dict(GRID, crs="not-a-crs"))
+    assert not decision.reusable
+    assert any("crs" in r for r in decision.stale_reasons)
+
+
+def test_non_string_crs_is_stale(tmp_path):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    decision = _eval_with_grid(pair, dict(GRID, crs=32646))
+    assert not decision.reusable
+    assert any("crs" in r for r in decision.stale_reasons)
+
+
+def test_expected_grid_not_object_is_structured_failure(tmp_path):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    decision = evaluate_pair_cache(
+        pair, expected_grid=["not", "a", "dict"], expected_sar_unit="dB",
+        expected_ignore_value=IGNORE, record=_good_record(pair),
+    )
+    assert not decision.reusable
+    assert any("not an object" in r for r in decision.stale_reasons)
+
+
+# =========================================================================== #
+# §4 Nodata / metadata consistency between builder and validator
+# =========================================================================== #
+
+def test_sar_grid_nan_nodata_convention_passes(tmp_path):
+    """Builder convention: nodata=NaN shared across bands; invalid pixels NaN."""
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)  # nodata=np.nan
+    with rasterio.open(pair / "s1_grid.tif") as src:
+        assert np.isnan(src.nodata)
+        assert src.count == 2
+        assert src.dtypes[0] == "float32"
+    decision = _evaluate(pair, _good_record(pair))
+    assert decision.reusable, decision.stale_reasons
+
+
+def test_finite_nodata_sentinel_with_matching_pixels_passes(tmp_path):
+    """A finite declared nodata sentinel is accepted when invalid pixels use it."""
+    pair = tmp_path / "pair_00"
+    vv = np.where(S1_VALID > 0.5, -12.0, -9999.0).astype("float32")
+    vh = np.where(S1_VALID > 0.5, -18.0, -9999.0).astype("float32")
+    _write_pair_two_band(pair, vv, vh, nodata=-9999.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert decision.reusable, decision.stale_reasons
+
+
+def test_finite_nodata_sentinel_but_plausible_invalid_value_is_stale(tmp_path):
+    """Declared finite sentinel, but an invalid pixel holds a plausible value."""
+    pair = tmp_path / "pair_00"
+    vv = np.where(S1_VALID > 0.5, -12.0, -9999.0).astype("float32")
+    vh = np.where(S1_VALID > 0.5, -18.0, -9999.0).astype("float32")
+    vh[7, 1] = -18.0  # plausible value on an invalid pixel
+    _write_pair_two_band(pair, vv, vh, nodata=-9999.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    assert any("band 2" in r for r in decision.stale_reasons)
