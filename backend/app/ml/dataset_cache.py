@@ -9,14 +9,23 @@ trusted.
 
 Builder semantics encoded here (do not invent new meanings):
 
-* ``s1_valid_mask.tif`` — valid SAR observations: AOI ∧ finite/sentinel-free SAR
-  over **all** bands (the builder's ``valid`` mask). ``s1_grid.tif`` is a
-  two-band (VV, VH) float32 SAR grid written with a single shared
-  ``nodata=NaN``; the builder sets **every** band to NaN wherever SAR is
-  invalid. The validator therefore checks each SAR band independently against
-  ``s1_valid_mask.tif``; a clean VV band must not excuse invalid VH data. A
-  finite declared nodata sentinel is also accepted, but a plausibly valid
-  backscatter value on an invalid pixel is rejected.
+* ``s1_valid_mask.tif`` / ``valid_mask.tif`` — single-band float32 masks written
+  with ``nodata=0.0``; their only permitted pixel values are the binary classes
+  ``{0, 1}``. ``0`` is the ``nodata`` metadata value *and* a legitimate mask
+  value, so it is never treated as an invalid pixel; nodata metadata never
+  authorizes any non-binary pixel (NaN/Inf or a finite sentinel such as
+  ``-9999``).
+* ``s1_valid_mask.tif`` also records valid SAR observations: AOI ∧ finite/
+  sentinel-free SAR over **all** bands (the builder's ``valid`` mask).
+  ``s1_grid.tif`` is a two-band (VV, VH) float32 SAR grid written with a single
+  shared ``nodata=NaN``; the builder sets **every** band to NaN wherever SAR is
+  invalid. The validator checks each SAR band **independently** against
+  ``s1_valid_mask.tif``: a clean VV band must not excuse invalid VH data. At a
+  pixel marked SAR-valid, a value is rejected if it is non-finite **or** equal to
+  the declared finite nodata sentinel (a sentinel is a validity contradiction,
+  not a measurement). At a pixel marked SAR-invalid, the value must be
+  non-finite or equal to the declared nodata sentinel; a plausible finite
+  backscatter value is rejected.
 * ``valid_mask.tif`` — valid supervision region: AOI ∧ valid SAR ∧ valid
   Sentinel-2 reference (the builder's ``pair_valid``). This is a subset of
   ``s1_valid_mask.tif``. The manifest ``valid_px`` field is defined as the count
@@ -294,30 +303,30 @@ def _validate_raster_against_grid(name: str, meta: dict, expected_grid: dict, re
 
 
 def _mask_is_binary(path: Path, *, reasons: list[str]) -> bool:
-    """Windowed scan: return True iff band 1 holds only binary ``{0, 1}`` values.
+    """Windowed scan: return True iff every pixel is a binary ``{0, 1}`` value.
 
-    NaN and +/-Inf are **rejected** explicitly, not filtered away: a non-finite
-    mask value is invalid and must not be silently treated as zero (or as a
-    valid pixel). Values equal to a declared finite nodata sentinel are permitted
-    (the builder declares ``nodata=0.0`` for masks, which is a real class, so a
-    finite nodata is *not* excused here unless it is that declared sentinel).
+    A binary mask accepts **only** ``0`` and ``1``:
+
+    * NaN and +/-Inf are **rejected** explicitly, not filtered away — a
+      non-finite mask value is invalid and must not be silently treated as zero
+      (or as a valid pixel).
+    * Any other finite value (e.g. a finite nodata sentinel such as ``-9999``)
+      is **rejected**. Mask nodata metadata does **not** authorize non-binary
+      pixels: the builder declares ``nodata=0.0`` for masks, and ``0`` is a
+      legitimate *valid* mask value, so it is never excused as an invalid pixel.
+      A non-zero, non-one nodata sentinel is likewise not a permitted pixel.
     """
-    meta = _read_raster_meta(path)
-    nodata = meta.get("nodata") if meta else None
     try:
         for _window, values in _iter_windows(path):
             if values.size == 0:
                 continue
             # 1. Reject NaN / +Inf / -Inf outright.
-            finite = np.isfinite(values)
-            if not finite.all():
+            if not np.isfinite(values).all():
                 reasons.append(f"{path.name} contains a non-finite (NaN/Inf) mask value")
                 return False
-            # 2. Every finite value must be a binary class (or the declared
-            #    finite nodata sentinel, if any).
+            # 2. Every finite value must be exactly 0 or 1. Nodata metadata is
+            #    deliberately NOT consulted here: only {0, 1} are permitted.
             binary = (np.abs(values) <= _BINARY_TOL) | (np.abs(values - 1.0) <= _BINARY_TOL)
-            if nodata is not None and math.isfinite(float(nodata)):
-                binary |= np.isclose(values, float(nodata), atol=_BINARY_TOL)
             if not binary.all():
                 example = float(values[~binary][0])
                 reasons.append(f"{path.name} has non-binary mask values (e.g. {example!r})")
@@ -474,12 +483,20 @@ def _validate_pixel_semantics(
                         )
                         sar_invalid_ok[band_index] = False
 
-                # Valid SAR pixels must be finite (never silently nodata/non-finite).
-                if sar_valid_finite_ok.get(band_index, True):
-                    if np.any(s1m & ~np.isfinite(band)):
+                # Valid SAR pixels must be finite AND must not equal the declared
+                # nodata sentinel. A finite sentinel (e.g. -9999) at a pixel the
+                # mask marks valid is a nodata/validity contradiction, not a
+                # measurement — reject it. NaN nodata is handled via `isfinite`
+                # (never by ordinary equality).
+                if sar_valid_finite_ok.get(band_index, True) and np.any(s1m):
+                    valid_values = band[s1m]
+                    ok = np.isfinite(valid_values)
+                    if s1_nodata is not None and math.isfinite(float(s1_nodata)):
+                        ok &= ~np.isclose(valid_values, float(s1_nodata), atol=_BINARY_TOL)
+                    if not ok.all():
                         reasons.append(
-                            f"{_SAR_GRID_ARTIFACT} band {band_no} has non-finite values where "
-                            f"{_S1_VALID_MASK_ARTIFACT} is 1"
+                            f"{_SAR_GRID_ARTIFACT} band {band_no} has a non-finite or nodata "
+                            f"sentinel value where {_S1_VALID_MASK_ARTIFACT} is 1"
                         )
                         sar_valid_finite_ok[band_index] = False
     except _RasterUnreadable as exc:

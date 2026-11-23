@@ -307,7 +307,7 @@ def test_non_finite_valid_sar_pixels_is_stale(tmp_path):
     _make_pair(pair, s1_values=bad_sar)
     decision = _evaluate(pair, _good_record(pair))
     assert not decision.reusable
-    assert any("non-finite values where" in r for r in decision.stale_reasons)
+    assert any("where" in r and "is 1" in r for r in decision.stale_reasons)
 
 
 def test_supervision_mask_not_subset_of_sar_mask_is_stale(tmp_path):
@@ -821,3 +821,122 @@ def test_finite_nodata_sentinel_but_plausible_invalid_value_is_stale(tmp_path):
     decision = _evaluate(pair, _good_record(pair))
     assert not decision.reusable
     assert any("band 2" in r for r in decision.stale_reasons)
+
+
+# =========================================================================== #
+# §1 (review) Finite SAR nodata sentinel must never appear at a SAR-valid pixel
+# =========================================================================== #
+
+def _sentinel_pair(nodata=-9999.0):
+    """A pair with a finite declared sentinel used at invalid pixels in both bands."""
+    vv = np.where(S1_VALID > 0.5, -12.0, nodata).astype("float32")
+    vh = np.where(S1_VALID > 0.5, -18.0, nodata).astype("float32")
+    return vv, vh
+
+
+def test_finite_sentinel_at_valid_pixel_band1_is_stale(tmp_path):
+    pair = tmp_path / "pair_00"
+    vv, vh = _sentinel_pair()
+    vv[2, 2] = -9999.0  # sentinel where s1_valid_mask == 1
+    _write_pair_two_band(pair, vv, vh, nodata=-9999.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    assert any("band 1" in r for r in decision.stale_reasons)
+
+
+def test_finite_sentinel_at_valid_pixel_band2_is_stale(tmp_path):
+    pair = tmp_path / "pair_00"
+    vv, vh = _sentinel_pair()
+    vh[3, 5] = -9999.0  # sentinel where s1_valid_mask == 1, band 2 only
+    _write_pair_two_band(pair, vv, vh, nodata=-9999.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    assert any("band 2" in r for r in decision.stale_reasons)
+
+
+def test_finite_sentinel_at_invalid_pixels_both_bands_is_reusable(tmp_path):
+    """Sentinel used consistently at invalid pixels (both bands) is the contract."""
+    pair = tmp_path / "pair_00"
+    vv, vh = _sentinel_pair()
+    _write_pair_two_band(pair, vv, vh, nodata=-9999.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert decision.reusable, decision.stale_reasons
+
+
+def test_nan_nodata_convention_still_passes(tmp_path):
+    """The default NaN-nodata builder convention continues to be accepted."""
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    decision = _evaluate(pair, _good_record(pair))
+    assert decision.reusable, decision.stale_reasons
+
+
+def test_each_sar_band_validated_independently_for_sentinel(tmp_path):
+    """Band 1 clean at valid pixels; band 2 carries a sentinel there -> stale."""
+    pair = tmp_path / "pair_00"
+    vv, vh = _sentinel_pair()
+    # Band 1 has no sentinel on valid pixels; band 2 does.
+    vh[1, 1] = -9999.0
+    _write_pair_two_band(pair, vv, vh, nodata=-9999.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    # Only the offending band is reported.
+    assert any("band 2" in r for r in decision.stale_reasons)
+    assert not any("band 1" in r for r in decision.stale_reasons)
+
+
+def test_plausible_finite_value_at_invalid_pixel_still_fails(tmp_path):
+    """Regression: the existing invalid-pixel check is preserved."""
+    pair = tmp_path / "pair_00"
+    vv, vh = _sentinel_pair()
+    vh[7, 0] = -18.0  # plausible value where s1_valid_mask == 0
+    _write_pair_two_band(pair, vv, vh, nodata=-9999.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    assert any("plausible value where" in r for r in decision.stale_reasons)
+
+
+# =========================================================================== #
+# §2 (review) Binary masks accept only {0, 1}; nodata cannot excuse -9999
+# =========================================================================== #
+
+def test_finite_sentinel_in_valid_mask_is_stale(tmp_path):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    bad = VALID.copy()
+    bad[3, 3] = -9999.0  # non-binary finite value in valid_mask
+    _write(pair / "valid_mask.tif", bad, nodata=0.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    assert any("valid_mask.tif" in r and "non-binary" in r for r in decision.stale_reasons)
+
+
+def test_finite_sentinel_in_s1_valid_mask_is_stale(tmp_path):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    bad = S1_VALID.copy()
+    bad[4, 4] = -9999.0
+    _write(pair / "s1_valid_mask.tif", bad, nodata=0.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+    assert any("s1_valid_mask.tif" in r and "non-binary" in r for r in decision.stale_reasons)
+
+
+def test_sentinel_as_declared_mask_nodata_still_non_binary_is_stale(tmp_path):
+    """Even if a mask DECLARES -9999 as nodata, a -9999 pixel is still rejected."""
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    bad = VALID.copy()
+    bad[2, 5] = -9999.0
+    # Declare the sentinel as the mask nodata; it must still be rejected because
+    # masks only permit {0, 1}.
+    _write(pair / "valid_mask.tif", bad, nodata=-9999.0)
+    decision = _evaluate(pair, _good_record(pair))
+    assert not decision.reusable
+
+
+def test_valid_binary_masks_only_zero_and_one_pass(tmp_path):
+    pair = tmp_path / "pair_00"
+    _make_pair(pair)
+    decision = _evaluate(pair, _good_record(pair))
+    assert decision.reusable, decision.stale_reasons
